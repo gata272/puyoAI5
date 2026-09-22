@@ -497,7 +497,7 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
 
     std::ostringstream json;
     json << "{";
-    json << "\"version\":5,";
+    json << "\"version\":6,";
     json << "\"games\":" << config.games << ",";
     json << "\"turns\":" << config.turns << ",";
     json << "\"seed\":" << config.seed << ",";
