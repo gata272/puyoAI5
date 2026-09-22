@@ -79,3 +79,20 @@ queue contexts.
 The current benchmark diagnostics distinguish `no_safe_move` from
 `selected_death_with_safe_move`; future tuning should prioritize reducing the
 former without lowering the maximum-chain distribution.
+
+
+## PuyoAI22: Recovery and post-chain reactivation
+
+The next refinement separates theoretical long-chain potential from realized recovery.
+Visible next/next-next probes now record actual net clearing, post-placement safe mobility,
+and follow-up clearing. These signals are used mainly in the danger zone so healthy GTR
+construction does not become a cash-out policy.
+
+After a recent chain of four or more, a short rebuild window rewards visible follow-up
+trigger potential and real continuation rather than passive survival. A separate short
+stagnation detector combines quiet turns, material accumulation, and weak visible trigger
+progress; it is danger-gated and therefore does not penalize ordinary quiet construction.
+
+Path-level minimum-safe-move memory remains diagnostic and is not folded into utility.
+The benchmark target is to reduce low-chain/death trajectories and post-large-chain deaths
+without reducing the existing 8+/10+/12+ distribution on both fixed seeds.
