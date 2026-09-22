@@ -273,6 +273,7 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
     std::vector<std::vector<DecisionLogEntry>> decisionLogs;
     if (config.recordDecisionLog) decisionLogs.resize(static_cast<std::size_t>(config.games));
     setDebugLogging(config.recordDecisionLog);
+    setDebugConsoleLogging(false);
 
     const auto benchmarkStart = std::chrono::steady_clock::now();
 
@@ -467,6 +468,7 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
     // The benchmark owns the detailed logger. Do not leak benchmark traces into
     // normal-play debug logging after this call returns.
     setDebugLogging(false);
+    setDebugConsoleLogging(true);
 
     const auto benchmarkEnd = std::chrono::steady_clock::now();
     const double wallMs = std::chrono::duration<double, std::milli>(
@@ -495,7 +497,7 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
 
     std::ostringstream json;
     json << "{";
-    json << "\"version\":4,";
+    json << "\"version\":5,";
     json << "\"games\":" << config.games << ",";
     json << "\"turns\":" << config.turns << ",";
     json << "\"seed\":" << config.seed << ",";
