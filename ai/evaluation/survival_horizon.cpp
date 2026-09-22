@@ -35,17 +35,12 @@ SurvivalHorizon analyzeSurvivalHorizon(
     // This matters because a trigger can clear puyos and make an apparently
     // dangerous landing safe; the old probe counted such a move as unsafe.
     const bool exactSafety = h[2] >= 10 || (maxHeight >= 13 && h[2] >= 9) || out.geometricMoves <= 4;
-    std::vector<Board> safeBoards;
-    if (nextNext) safeBoards.reserve(moves.size());
 
     for (const Move& move : moves) {
         bool safe = false;
-        Board projected;
-
         if (exactSafety) {
             const SimulationResult sim = Simulator::drop(board, *next, move);
             safe = !sim.gameOver || sim.allClear;
-            if (safe && nextNext) projected = sim.board;
         } else {
             const int y = Simulator::findDropY(board, *next, move.x, move.rotation);
             if (y < 0) continue;
@@ -69,58 +64,77 @@ SurvivalHorizon analyzeSurvivalHorizon(
             }
             safe = landingHeight2 < VISIBLE_HEIGHT;
 
-            if (safe && nextNext) {
-                projected = board;
-                switch (move.rotation & 3) {
-                    case 0:
-                        projected.set(move.x, y, static_cast<Cell>(next->main));
-                        projected.set(move.x, y + 1, static_cast<Cell>(next->sub));
-                        break;
-                    case 1:
-                        projected.set(move.x, y, static_cast<Cell>(next->main));
-                        projected.set(move.x - 1, y, static_cast<Cell>(next->sub));
-                        break;
-                    case 2:
-                        projected.set(move.x, y, static_cast<Cell>(next->main));
-                        projected.set(move.x, y - 1, static_cast<Cell>(next->sub));
-                        break;
-                    case 3:
-                        projected.set(move.x, y, static_cast<Cell>(next->main));
-                        projected.set(move.x + 1, y, static_cast<Cell>(next->sub));
-                        break;
-                }
-            }
         }
 
         if (!safe) continue;
         ++out.safeMoves;
-        if (nextNext) safeBoards.push_back(std::move(projected));
     }
 
-    // Exact visible-piece trigger probe.  This is intentionally limited to
-    // the narrow/terminal region: it answers a different question from
-    // virtualChainPotential -- "can the actual next pair start or continue a
-    // chain?"  This prevents an arbitrary-colour virtual route from masking a
-    // real shortage of the queued colours.
-    if (out.safeMoves <= 4 || maxHeight >= 12) {
+    // Exact visible-piece trigger/progress probe.  We evaluate every legal
+    // first placement once, then follow only a bounded, diverse shortlist.
+    // This preserves the important "setup without immediate fire" cases while
+    // preventing the diagnostic from turning into a second full beam search.
+    if (nextNext) {
+        struct FirstStep {
+            Move move;
+            SimulationResult sim;
+            int maxHeight = 0;
+            int dangerHeight = 0;
+        };
+        std::vector<FirstStep> firstSteps;
+        firstSteps.reserve(moves.size());
+
         for (const Move& move : moves) {
             const SimulationResult sim = Simulator::drop(board, *next, move);
             if (sim.gameOver && !sim.allClear) continue;
+            const auto heights = sim.board.heights();
+            out.trueImmediateChains = std::max(out.trueImmediateChains, sim.chains);
+            out.bestImmediateChains = std::max(out.bestImmediateChains, sim.chains);
+            if (sim.chains > 0) {
+                ++out.trueTriggerMoves;
+                ++out.productiveNextMoves;
+            }
+            out.trueTriggerPath = std::max(out.trueTriggerPath, sim.chains);
+            out.bestTriggerPath = std::max(out.bestTriggerPath, sim.chains);
+            firstSteps.push_back({
+                move,
+                sim,
+                *std::max_element(heights.begin(), heights.end()),
+                heights[2]
+            });
+        }
 
-            out.trueImmediateChains =
-                std::max(out.trueImmediateChains, sim.chains);
-            if (sim.chains > 0) ++out.trueTriggerMoves;
-            out.trueTriggerPath =
-                std::max(out.trueTriggerPath, sim.chains);
+        std::stable_sort(firstSteps.begin(), firstSteps.end(),
+            [](const FirstStep& a, const FirstStep& b) {
+                if (a.sim.chains != b.sim.chains) return a.sim.chains > b.sim.chains;
+                if (a.dangerHeight != b.dangerHeight) return a.dangerHeight < b.dangerHeight;
+                if (a.maxHeight != b.maxHeight) return a.maxHeight < b.maxHeight;
+                if (a.move.x != b.move.x) return a.move.x < b.move.x;
+                return a.move.rotation < b.move.rotation;
+            });
 
-            if (!nextNext) continue;
+        // Keep every immediately productive move when possible, plus a bounded
+        // set of non-firing setup moves. The latter is essential for detecting
+        // A->B handoff construction instead of rewarding only cash-out moves.
+        std::vector<const FirstStep*> shortlist;
+        shortlist.reserve(std::min<std::size_t>(firstSteps.size(), 8));
+        for (const auto& step : firstSteps) {
+            if (step.sim.chains > 0) shortlist.push_back(&step);
+        }
+        const std::size_t maxProbe = 8;
+        for (const auto& step : firstSteps) {
+            if (shortlist.size() >= maxProbe) break;
+            if (step.sim.chains == 0) shortlist.push_back(&step);
+        }
+        if (shortlist.size() > maxProbe) shortlist.resize(maxProbe);
 
-            const auto followMoves = generateLegalMoves(sim.board, *nextNext);
+        for (const FirstStep* step : shortlist) {
+            const auto followMoves = generateLegalMoves(step->sim.board, *nextNext);
             int followSafe = 0;
             int bestFollow = 0;
             for (const Move& followMove : followMoves) {
                 const SimulationResult follow =
-                    Simulator::drop(sim.board, *nextNext, followMove);
+                    Simulator::drop(step->sim.board, *nextNext, followMove);
                 if (follow.gameOver && !follow.allClear) continue;
                 ++followSafe;
                 bestFollow = std::max(bestFollow, follow.chains);
@@ -130,8 +144,27 @@ SurvivalHorizon analyzeSurvivalHorizon(
                 std::max(out.trueFollowupSafeMoves, followSafe);
             out.trueFollowupChains =
                 std::max(out.trueFollowupChains, bestFollow);
+            out.bestFollowupChains =
+                std::max(out.bestFollowupChains, bestFollow);
+            if (bestFollow > 0) ++out.productiveFollowupMoves;
             out.trueTriggerPath =
-                std::max(out.trueTriggerPath, sim.chains + bestFollow);
+                std::max(out.trueTriggerPath, step->sim.chains + bestFollow);
+            out.bestTriggerPath =
+                std::max(out.bestTriggerPath, step->sim.chains + bestFollow);
+        }
+    } else {
+        // Keep the one-pair diagnostic useful when the queue is exhausted.
+        for (const Move& move : moves) {
+            const SimulationResult sim = Simulator::drop(board, *next, move);
+            if (sim.gameOver && !sim.allClear) continue;
+            out.trueImmediateChains = std::max(out.trueImmediateChains, sim.chains);
+            out.bestImmediateChains = std::max(out.bestImmediateChains, sim.chains);
+            if (sim.chains > 0) {
+                ++out.trueTriggerMoves;
+                ++out.productiveNextMoves;
+            }
+            out.trueTriggerPath = std::max(out.trueTriggerPath, sim.chains);
+            out.bestTriggerPath = std::max(out.bestTriggerPath, sim.chains);
         }
     }
 
@@ -141,22 +174,41 @@ SurvivalHorizon analyzeSurvivalHorizon(
     if (nextNext && out.safeMoves <= 4) {
         out.bestNextGeometricMoves = 0;
         out.bestNextSafeMoves = 0;
-        for (const Board& projected : safeBoards) {
-            const auto nextMoves = generateLegalMoves(projected, *nextNext);
+        // Re-simulate the first horizon exactly here. The cheap landing-height
+        // probe above intentionally does not resolve chains on healthy boards;
+        // reusing that approximate board would therefore under/over-count the
+        // second-step escape route when the first placement triggers a clear.
+        struct EscapeCandidate { Board board; int h2 = 0; int maxHeight = 0; };
+        std::vector<EscapeCandidate> escapeCandidates;
+        escapeCandidates.reserve(moves.size());
+        for (const Move& move : moves) {
+            const SimulationResult first = Simulator::drop(board, *next, move);
+            if (first.gameOver && !first.allClear) continue;
+            const auto heights = first.board.heights();
+            escapeCandidates.push_back({
+                first.board,
+                heights[2],
+                *std::max_element(heights.begin(), heights.end())
+            });
+        }
+        std::stable_sort(escapeCandidates.begin(), escapeCandidates.end(),
+            [](const EscapeCandidate& a, const EscapeCandidate& b) {
+                if (a.h2 != b.h2) return a.h2 < b.h2;
+                return a.maxHeight < b.maxHeight;
+            });
+        const std::size_t escapeProbe = std::min<std::size_t>(escapeCandidates.size(), 10);
+        for (std::size_t i = 0; i < escapeProbe; ++i) {
+            const auto nextMoves = generateLegalMoves(escapeCandidates[i].board, *nextNext);
             out.bestNextGeometricMoves = std::max(
                 out.bestNextGeometricMoves,
                 static_cast<int>(nextMoves.size())
             );
 
-            // Use the exact simulator here.  The cheap first-horizon probe can
-            // deliberately avoid resolution on healthy boards, but a
-            // two-step escape signal must not call a trigger-clearing move
-            // "unsafe" merely because gravity/chain resolution was omitted.
             int safeSecond = 0;
-            for (const Move& move : nextMoves) {
-                const SimulationResult sim =
-                    Simulator::drop(projected, *nextNext, move);
-                if (!sim.gameOver || sim.allClear) ++safeSecond;
+            for (const Move& followMove : nextMoves) {
+                const SimulationResult second =
+                    Simulator::drop(escapeCandidates[i].board, *nextNext, followMove);
+                if (!second.gameOver || second.allClear) ++safeSecond;
             }
             out.bestNextSafeMoves = std::max(out.bestNextSafeMoves, safeSecond);
         }

@@ -6,6 +6,7 @@
 namespace puyo {
 namespace {
 bool g_enabled = false;
+bool g_consoleEnabled = true;
 std::ostringstream g_log;
 std::mutex g_mutex;
 }
@@ -21,10 +22,15 @@ bool debugLoggingEnabled() {
     return g_enabled;
 }
 
+void setDebugConsoleLogging(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_consoleEnabled = enabled;
+}
+
 void debugLog(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_enabled) return;
-    std::cout << message << std::endl;
+    if (g_consoleEnabled) std::cout << message << std::endl;
     g_log << message << '\n';
 }
 

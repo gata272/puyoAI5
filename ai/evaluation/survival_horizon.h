@@ -29,6 +29,16 @@ struct SurvivalHorizon {
     int trueTriggerPath = 0;
     int trueTriggerMoves = 0;
     int trueFollowupSafeMoves = 0;
+
+    // Chain-progress diagnostics using only the visible next two pairs.
+    // These are intentionally not hidden-future search: they answer whether
+    // the current construction has a real way to start/continue a chain with
+    // the pieces the AI can actually see.
+    int productiveNextMoves = 0;
+    int productiveFollowupMoves = 0;
+    int bestImmediateChains = 0;
+    int bestFollowupChains = 0;
+    int bestTriggerPath = 0;
 };
 
 SurvivalHorizon analyzeSurvivalHorizon(
