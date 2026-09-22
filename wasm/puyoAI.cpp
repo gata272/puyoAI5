@@ -1,0 +1,145 @@
+#include <emscripten/emscripten.h>
+
+#include "../ai/ai.h"
+#include "../ai/benchmark/chain_benchmark.h"
+
+#include <array>
+#include <vector>
+#include <string>
+
+static std::string g_benchmarkResult;
+
+namespace {
+
+puyo::AI g_ai;
+puyo::Board g_board;
+
+puyo::Cell decodeCell(int value) {
+    if (value < 0 || value > 5) return puyo::Cell::Empty;
+    return static_cast<puyo::Cell>(value);
+}
+
+} // namespace
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+void reset_ai() {
+    g_ai.reset();
+    g_board.clear();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void set_board_cell(int index, int value) {
+    if (index < 0 || index >= puyo::BOARD_WIDTH * puyo::BOARD_HEIGHT) {
+        return;
+    }
+
+    const int x = index % puyo::BOARD_WIDTH;
+    const int y = index / puyo::BOARD_WIDTH;
+    g_board.set(x, y, decodeCell(value));
+}
+
+EMSCRIPTEN_KEEPALIVE
+int ai_choose_move(
+    int turn,
+    int sub1, int main1,
+    int sub2, int main2,
+    int sub3, int main3,
+    int sub4, int main4,
+    int sub5, int main5,
+    int sub6, int main6,
+    int sub7, int main7,
+    int sub8, int main8,
+    int sub9, int main9,
+    int sub10, int main10,
+    int depth, int beamWidth
+) {
+    std::vector<puyo::PuyoPair> pieces = {
+        {main1, sub1},
+        {main2, sub2},
+        {main3, sub3},
+        {main4, sub4},
+        {main5, sub5},
+        {main6, sub6},
+        {main7, sub7},
+        {main8, sub8},
+        {main9, sub9},
+        {main10, sub10}
+    };
+
+    puyo::Move move = g_ai.chooseMove(
+        turn,
+        g_board,
+        pieces,
+        depth,
+        beamWidth
+    );
+
+    if (!move.valid) return -1;
+
+    return move.x * 10 + move.rotation;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* run_chain_benchmark(
+    int games,
+    int turns,
+    int seed,
+    int depth,
+    int beamWidth,
+    int recordDecisionLog
+) {
+    puyo::ChainBenchmarkConfig config;
+    config.games = games;
+    config.turns = turns;
+    config.seed = seed;
+    config.depth = depth;
+    config.beamWidth = beamWidth;
+    config.recordDecisionLog = recordDecisionLog != 0;
+    g_benchmarkResult = puyo::runChainBenchmark(config);
+    return g_benchmarkResult.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void reset_ai_weights() {
+    g_ai.resetWeights();
+}
+
+int get_ai_weight_count() {
+    return g_ai.weightCount();
+}
+
+const char* get_ai_weight_name(int index) {
+    return g_ai.weightName(index);
+}
+
+double get_ai_weight(int index) {
+    return g_ai.getWeight(index);
+}
+
+int set_ai_weight(int index, double value) {
+    return g_ai.setWeight(index, value) ? 1 : 0;
+}
+
+const char* get_ai_pattern_name() {
+    return g_ai.patternName();
+}
+
+}
+
+#include "../ai/evaluation/debug_log.h"
+
+extern "C" {
+
+void set_ai_debug_logging(int enabled) {
+    puyo::setDebugLogging(enabled != 0);
+}
+
+const char* get_ai_debug_log() {
+    static std::string buffer;
+    buffer = puyo::takeDebugLog();
+    return buffer.c_str();
+}
+
+}
