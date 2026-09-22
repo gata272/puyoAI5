@@ -1,4 +1,4 @@
-const CACHE_NAME = 'puyo-sim-v6-ai3';
+const CACHE_NAME = 'puyo-sim-v7-benchmark-fix';
 
 const urlsToCache = [
     './',
@@ -11,6 +11,7 @@ const urlsToCache = [
     './puyo-ai-worker-wasm.js',
     './puyoAI_wasm.mjs',
     './puyoAI_wasm.wasm',
+    './benchmark-worker.js',
     './manifest.json',
     './apple-touch-icon.png',
     './android-icon-192x192.png',

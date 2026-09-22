@@ -51,8 +51,23 @@
         STATE.running = running;
         const button = $('run-benchmark-button');
         if (button) {
-            button.disabled = running || !STATE.ready;
-            button.textContent = running ? '測定中…' : '最大連鎖ベンチマーク開始';
+            // Keep the button usable after an initialization failure so the
+            // user can retry without reloading the page.
+            button.disabled = !!running;
+            button.textContent = running
+                ? '測定中…'
+                : (STATE.ready ? '最大連鎖ベンチマーク開始' : 'ベンチマーク再初期化');
+        }
+    }
+
+    function setWorkerFailure(message) {
+        STATE.ready = false;
+        STATE.running = false;
+        setStatus(message);
+        const button = $('run-benchmark-button');
+        if (button) {
+            button.disabled = false;
+            button.textContent = 'ベンチマーク再初期化';
         }
     }
 
@@ -183,10 +198,54 @@
 
     function initWorker() {
         if (STATE.worker) return;
-        STATE.worker = new Worker('./benchmark-worker.js', { type: 'module' });
-        STATE.worker.onmessage = (event) => {
+
+        STATE.ready = false;
+        setStatus('ベンチマークWASMを初期化中…');
+
+        let worker;
+        try {
+            worker = new Worker('./benchmark-worker.js', { type: 'module' });
+        } catch (error) {
+            STATE.worker = null;
+            setWorkerFailure(`ベンチマークWorker作成失敗: ${error?.message || error}`);
+            return;
+        }
+
+        STATE.worker = worker;
+        let initialized = false;
+        const initTimer = setTimeout(() => {
+            if (initialized || STATE.worker !== worker) return;
+            try { worker.terminate(); } catch (_) {}
+            STATE.worker = null;
+            setWorkerFailure(
+                'ベンチマークWASMの初期化がタイムアウトしました。' +
+                'ページを再読み込みして再試行してください。'
+            );
+        }, 30000);
+
+        worker.onerror = (event) => {
+            clearTimeout(initTimer);
+            const message = event?.message || 'Workerスクリプトの読み込みに失敗しました';
+            try { worker.terminate(); } catch (_) {}
+            if (STATE.worker === worker) STATE.worker = null;
+            setWorkerFailure(`ベンチマークWorkerエラー: ${message}`);
+            console.error('[Benchmark Worker]', event);
+        };
+
+        worker.onmessageerror = (event) => {
+            setWorkerFailure('ベンチマークWorkerとの通信に失敗しました');
+            console.error('[Benchmark Worker messageerror]', event);
+        };
+
+        worker.onmessage = (event) => {
             const msg = event.data || {};
+            if (msg.type === 'initializing') {
+                setStatus(msg.message || 'ベンチマークWASMを初期化中…');
+                return;
+            }
             if (msg.type === 'ready') {
+                initialized = true;
+                clearTimeout(initTimer);
                 STATE.ready = true;
                 setRunning(false);
                 setStatus('ベンチマーク準備完了');
@@ -222,9 +281,17 @@
                 return;
             }
             if (msg.type === 'error') {
-                setRunning(false);
-                setStatus(msg.message || 'ベンチマークエラー');
-                console.error(msg.message);
+                const message = msg.message || 'ベンチマークエラー';
+                if (!initialized) {
+                    clearTimeout(initTimer);
+                    try { worker.terminate(); } catch (_) {}
+                    if (STATE.worker === worker) STATE.worker = null;
+                    setWorkerFailure(message);
+                } else {
+                    setRunning(false);
+                    setStatus(message);
+                }
+                console.error(message);
             }
         };
     }
@@ -333,7 +400,7 @@
         if (STATE.running) return;
         initWorker();
         if (!STATE.ready) {
-            setStatus('WASMベンチマークを初期化中です。少し待ってください。');
+            setStatus('WASMベンチマークを初期化中です。準備完了後にもう一度押してください。');
             return;
         }
 
