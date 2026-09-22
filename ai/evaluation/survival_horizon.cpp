@@ -6,8 +6,23 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
+#include <numeric>
 
 namespace puyo {
+namespace {
+
+int occupiedCount(const Board& board) {
+    int occupied = 0;
+    const auto& cells = board.cells();
+    for (const auto& column : cells) {
+        for (Cell cell : column) {
+            if (cell != Cell::Empty) ++occupied;
+        }
+    }
+    return occupied;
+}
+
+} // namespace
 
 SurvivalHorizon analyzeSurvivalHorizon(
     const Board& board,
@@ -113,31 +128,43 @@ SurvivalHorizon analyzeSurvivalHorizon(
                 return a.move.rotation < b.move.rotation;
             });
 
-        // Keep every immediately productive move when possible, plus a bounded
-        // set of non-firing setup moves. The latter is essential for detecting
-        // A->B handoff construction instead of rewarding only cash-out moves.
+        // Keep a bounded but deliberately diverse set of first steps. The
+        // list is ordered by immediate chain count, then by danger height and
+        // surface height, so it contains both cash-out moves and low-risk
+        // setup moves without turning this diagnostic into a second beam.
         std::vector<const FirstStep*> shortlist;
-        shortlist.reserve(std::min<std::size_t>(firstSteps.size(), 8));
-        for (const auto& step : firstSteps) {
-            if (step.sim.chains > 0) shortlist.push_back(&step);
-        }
-        const std::size_t maxProbe = 8;
+        shortlist.reserve(std::min<std::size_t>(firstSteps.size(), 10));
+        const std::size_t maxProbe = 10;
         for (const auto& step : firstSteps) {
             if (shortlist.size() >= maxProbe) break;
-            if (step.sim.chains == 0) shortlist.push_back(&step);
+            shortlist.push_back(&step);
         }
-        if (shortlist.size() > maxProbe) shortlist.resize(maxProbe);
 
+        const int beforeOccupied = occupiedCount(board);
         for (const FirstStep* step : shortlist) {
+            const int afterOccupied = occupiedCount(step->sim.board);
+            const int immediateNetClear = std::max(0, beforeOccupied - afterOccupied);
+            out.bestImmediateNetClear =
+                std::max(out.bestImmediateNetClear, immediateNetClear);
+
             const auto followMoves = generateLegalMoves(step->sim.board, *nextNext);
             int followSafe = 0;
             int bestFollow = 0;
+            int bestFollowNetClear = 0;
+            int bestFollowPostHeight = VISIBLE_HEIGHT;
             for (const Move& followMove : followMoves) {
                 const SimulationResult follow =
                     Simulator::drop(step->sim.board, *nextNext, followMove);
                 if (follow.gameOver && !follow.allClear) continue;
                 ++followSafe;
                 bestFollow = std::max(bestFollow, follow.chains);
+                const int finalOccupied = occupiedCount(follow.board);
+                bestFollowNetClear = std::max(
+                    bestFollowNetClear, std::max(0, beforeOccupied - finalOccupied));
+                const auto finalHeights = follow.board.heights();
+                bestFollowPostHeight = std::min(
+                    bestFollowPostHeight,
+                    *std::max_element(finalHeights.begin(), finalHeights.end()));
             }
 
             out.trueFollowupSafeMoves =
@@ -146,11 +173,34 @@ SurvivalHorizon analyzeSurvivalHorizon(
                 std::max(out.trueFollowupChains, bestFollow);
             out.bestFollowupChains =
                 std::max(out.bestFollowupChains, bestFollow);
+            out.bestFollowupNetClear =
+                std::max(out.bestFollowupNetClear, bestFollowNetClear);
+            out.bestImmediatePostSafeMoves =
+                std::max(out.bestImmediatePostSafeMoves, followSafe);
+            const auto postHeights = step->sim.board.heights();
+            out.bestImmediatePostMaxHeight =
+                std::min(out.bestImmediatePostMaxHeight,
+                         *std::max_element(postHeights.begin(), postHeights.end()));
             if (bestFollow > 0) ++out.productiveFollowupMoves;
             out.trueTriggerPath =
                 std::max(out.trueTriggerPath, step->sim.chains + bestFollow);
             out.bestTriggerPath =
                 std::max(out.bestTriggerPath, step->sim.chains + bestFollow);
+
+            // A chain of four or more is treated as a true recovery event:
+            // the relevant question is no longer only how large that chain
+            // was, but whether the next visible pair can start another route
+            // after the board has been cleared.
+            if (step->sim.chains >= 4) {
+                ++out.rebuildCandidates;
+                out.bestRebuildChain = std::max(out.bestRebuildChain, bestFollow);
+                out.bestRebuildNetClear =
+                    std::max(out.bestRebuildNetClear, bestFollowNetClear);
+                out.bestRebuildNextSafeMoves =
+                    std::max(out.bestRebuildNextSafeMoves, followSafe);
+            }
+
+            (void)bestFollowPostHeight;
         }
     } else {
         // Keep the one-pair diagnostic useful when the queue is exhausted.

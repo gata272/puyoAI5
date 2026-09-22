@@ -39,6 +39,18 @@ struct SurvivalHorizon {
     int bestImmediateChains = 0;
     int bestFollowupChains = 0;
     int bestTriggerPath = 0;
+
+    // Recovery / reactivation probes. These are computed from the visible
+    // next two pairs only and describe whether a candidate can actually clear
+    // space and continue building after that clear.
+    int bestImmediateNetClear = 0;
+    int bestImmediatePostSafeMoves = -1;
+    int bestImmediatePostMaxHeight = VISIBLE_HEIGHT;
+    int bestFollowupNetClear = 0;
+    int bestRebuildChain = 0;
+    int bestRebuildNetClear = 0;
+    int bestRebuildNextSafeMoves = -1;
+    int rebuildCandidates = 0;
 };
 
 SurvivalHorizon analyzeSurvivalHorizon(
