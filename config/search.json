@@ -11,6 +11,9 @@
   "chainDependencyPath": "primary latent-chain signal; evaluates the longest sequential hypothetical trigger path and permits repeated colours such as A->B->A->C",
   "survivalHorizon": "After candidate placement, measure next-pair landing-safe mobility and a cheap second-step geometric mobility probe; sharply penalize 0-2 safe moves and rapid 2+ move collapses, but cap the signal so long-chain potential remains primary",
   "visibleChainProgress": "Probe only the visible next and next-next pairs for real chain-producing placements and trigger-path continuity; reward A->B-style progress and penalize safe stagnation only when visible chain progress is absent and mobility is also collapsing",
+  "recoveryProgress": "Measure actual net board clearing and post-placement mobility for visible next pairs; activate recovery weight mainly in the danger zone so the policy does not cash out healthy constructions",
+  "postChainRebuild": "For four-chain-or-larger recent clears, prefer visible follow-up triggers and reactivation over passive rebuilding; path-level survival history remains diagnostic only",
+  "stagnationDetection": "Track short path memory of quiet turns and material growth; penalize only when danger, accumulation, and weak visible trigger progress agree",
   "branchPolicy": "parallel same-wave removals are not rewarded; a small penalty is applied because they consume material without increasing chain count",
   "constructionGeometry": "latent 4/5 chain-unit potential, 2+2 bridge preparation, surface roughness, maximum adjacent height step, dead-space avoidance, bounded future construction space, tail landing space, height variance, and soft edge-wall geometry"
 }
