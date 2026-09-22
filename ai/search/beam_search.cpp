@@ -81,6 +81,24 @@ struct Node {
     int bestImmediateChains = 0;
     int bestFollowupChains = 0;
     int bestTriggerPath = 0;
+    int bestImmediateNetClear = 0;
+    int bestImmediatePostSafeMoves = -1;
+    int bestImmediatePostMaxHeight = VISIBLE_HEIGHT;
+    int bestFollowupNetClear = 0;
+    int bestRebuildChain = 0;
+    int bestRebuildNetClear = 0;
+    int bestRebuildNextSafeMoves = -1;
+    int rebuildCandidates = 0;
+
+    // Short path memory used only for danger-gated stagnation and post-chain
+    // rebuild detection. It never becomes a long-horizon survival penalty.
+    int currentOccupied = 0;
+    int currentMaxHeight = 0;
+    int currentDangerHeight = 0;
+    int lastChains = 0;
+    int postChainAge = 99;
+    int quietTurns = 0;
+    int occupiedGrowth = 0;
 
     bool gameOver = false;
     std::uint64_t boardHash = 0;
@@ -222,6 +240,33 @@ std::vector<Node> expandNode(
         candidate.bestImmediateChains = 0;
         candidate.bestFollowupChains = 0;
         candidate.bestTriggerPath = 0;
+        candidate.bestImmediateNetClear = 0;
+        candidate.bestImmediatePostSafeMoves = -1;
+        candidate.bestImmediatePostMaxHeight = VISIBLE_HEIGHT;
+        candidate.bestFollowupNetClear = 0;
+        candidate.bestRebuildChain = 0;
+        candidate.bestRebuildNetClear = 0;
+        candidate.bestRebuildNextSafeMoves = -1;
+        candidate.rebuildCandidates = 0;
+
+        const auto childHeights = sim.board.heights();
+        candidate.currentOccupied = std::accumulate(
+            childHeights.begin(), childHeights.end(), 0);
+        candidate.currentMaxHeight = *std::max_element(
+            childHeights.begin(), childHeights.end());
+        candidate.currentDangerHeight = childHeights[2];
+        candidate.lastChains = sim.chains;
+        candidate.postChainAge = sim.chains >= 4
+            ? 0
+            : (parent.postChainAge < 99 ? std::min(parent.postChainAge + 1, 99) : 99);
+        candidate.quietTurns = sim.chains >= 2
+            ? 0
+            : std::min(parent.quietTurns + 1, 99);
+        const int growth = std::max(
+            0, candidate.currentOccupied - parent.currentOccupied);
+        candidate.occupiedGrowth = sim.chains >= 2
+            ? 0
+            : std::min(parent.occupiedGrowth + growth, 48);
         candidate.gameOver = deathMove;
 
         if (deathMove) death.push_back(std::move(candidate));
@@ -461,6 +506,14 @@ void applySurvivalProbe(
         node.bestImmediateChains = h.bestImmediateChains;
         node.bestFollowupChains = h.bestFollowupChains;
         node.bestTriggerPath = h.bestTriggerPath;
+        node.bestImmediateNetClear = h.bestImmediateNetClear;
+        node.bestImmediatePostSafeMoves = h.bestImmediatePostSafeMoves;
+        node.bestImmediatePostMaxHeight = h.bestImmediatePostMaxHeight;
+        node.bestFollowupNetClear = h.bestFollowupNetClear;
+        node.bestRebuildChain = h.bestRebuildChain;
+        node.bestRebuildNetClear = h.bestRebuildNetClear;
+        node.bestRebuildNextSafeMoves = h.bestRebuildNextSafeMoves;
+        node.rebuildCandidates = h.rebuildCandidates;
 
         // Preserve the worst point reached anywhere on the path.  A branch
         // that briefly reaches zero/one safe move is dangerous even if the
@@ -527,6 +580,14 @@ void applyProgressProbe(
         node.bestImmediateChains = h.bestImmediateChains;
         node.bestFollowupChains = h.bestFollowupChains;
         node.bestTriggerPath = h.bestTriggerPath;
+        node.bestImmediateNetClear = h.bestImmediateNetClear;
+        node.bestImmediatePostSafeMoves = h.bestImmediatePostSafeMoves;
+        node.bestImmediatePostMaxHeight = h.bestImmediatePostMaxHeight;
+        node.bestFollowupNetClear = h.bestFollowupNetClear;
+        node.bestRebuildChain = h.bestRebuildChain;
+        node.bestRebuildNetClear = h.bestRebuildNetClear;
+        node.bestRebuildNextSafeMoves = h.bestRebuildNextSafeMoves;
+        node.rebuildCandidates = h.rebuildCandidates;
     }
 }
 
@@ -613,6 +674,21 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " bestNow=" << x.bestImmediateChains
             << " bestFollow=" << x.bestFollowupChains
             << " bestPath=" << x.bestTriggerPath
+            << " netNow=" << x.bestImmediateNetClear
+            << " postSafe=" << x.bestImmediatePostSafeMoves
+            << " postMaxH=" << x.bestImmediatePostMaxHeight
+            << " netFollow=" << x.bestFollowupNetClear
+            << " rebuild=" << x.bestRebuildChain
+            << " rebuildNet=" << x.bestRebuildNetClear
+            << " rebuildSafe=" << x.bestRebuildNextSafeMoves
+            << " rebuildN=" << x.rebuildCandidates
+            << " occ=" << x.currentOccupied
+            << " maxH=" << x.currentMaxHeight
+            << " h2=" << x.currentDangerHeight
+            << " lastChain=" << x.lastChains
+            << " postAge=" << x.postChainAge
+            << " quiet=" << x.quietTurns
+            << " occGrowth=" << x.occupiedGrowth
             << " rootSafe=" << x.rootFutureSafeMoves
             << " structure=" << x.structure
             << " mainChain=" << x.mainChain.length()
@@ -622,12 +698,108 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
     debugLog(oss.str());
 }
 
+double progressUtility(const Node& n) {
+    double score = 0.0;
+    if (n.bestTriggerPath >= 3) score += 7500.0;
+    else if (n.bestTriggerPath >= 2) score += 3000.0;
+    if (n.bestImmediateChains == 0 && n.bestFollowupChains == 0) {
+        if (n.worstFutureSafeMoves <= 3 || n.worstNext2SafeMoves <= 1)
+            score -= 6500.0;
+        else if (n.worstFutureSafeMoves <= 5)
+            score -= 1200.0;
+    }
+    if (n.productiveNextMoves > 0)
+        score += std::min(2500.0, 500.0 * n.productiveNextMoves);
+    if (n.productiveFollowupMoves > 0)
+        score += std::min(2000.0, 250.0 * n.productiveFollowupMoves);
+    return score;
+}
+
+double recoveryUtility(const Node& n) {
+    const bool danger =
+        n.currentDangerHeight >= 10 || n.currentMaxHeight >= 11 ||
+        (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 9);
+    const bool caution =
+        danger || n.currentOccupied >= 56 ||
+        (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 13);
+
+    double score = 0.0;
+    // Net clearing is the safest way to distinguish a true recovery from a
+    // merely large-looking chain. Keep this term modest on healthy boards.
+    if (caution) {
+        score += std::min(24, n.bestImmediateNetClear) * (danger ? 650.0 : 300.0);
+        score += std::min(24, n.bestFollowupNetClear) * (danger ? 450.0 : 180.0);
+        if (n.bestImmediatePostSafeMoves >= 0) {
+            score += std::clamp(
+                static_cast<double>(n.bestImmediatePostSafeMoves - 6) *
+                    (danger ? 650.0 : 300.0),
+                -2500.0, 5000.0);
+        }
+        if (n.bestImmediatePostMaxHeight < VISIBLE_HEIGHT) {
+            score += std::clamp(
+                static_cast<double>(11 - n.bestImmediatePostMaxHeight) *
+                    (danger ? 500.0 : 180.0),
+                -1500.0, 3000.0);
+        }
+    }
+
+    // Do not globally reward firing. A large immediate chain is valuable as a
+    // recovery only when the board is already entering the danger zone.
+    if (danger) {
+        if (n.bestImmediateChains >= 6) score += 3500.0;
+        else if (n.bestImmediateChains >= 4) score += 1800.0;
+        if (n.bestFollowupChains >= 4) score += 2200.0;
+        else if (n.bestFollowupChains >= 2) score += 900.0;
+    }
+    return std::clamp(score, -6000.0, 18000.0);
+}
+
+double rebuildUtility(const Node& n) {
+    if (n.postChainAge > 4) return 0.0;
+
+    double score = 0.0;
+    if (n.bestRebuildChain >= 4) score += 7000.0;
+    else if (n.bestRebuildChain >= 2) score += 4200.0;
+    else if (n.bestRebuildChain >= 1) score += 1200.0;
+
+    score += std::min(20, n.bestRebuildNetClear) * 280.0;
+    if (n.bestRebuildNextSafeMoves >= 0) {
+        score += std::clamp(
+            static_cast<double>(n.bestRebuildNextSafeMoves - 6) * 280.0,
+            -1200.0, 3000.0);
+    }
+
+    const bool danger = n.currentDangerHeight >= 10 ||
+                        n.currentMaxHeight >= 11 ||
+                        (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 9);
+    if (danger && n.bestRebuildChain == 0 && n.bestImmediateChains == 0) {
+        score -= 3500.0;
+    }
+    return std::clamp(score, -5000.0, 13000.0);
+}
+
+double stagnationUtility(const Node& n) {
+    // Stagnation is only penalized when three signals agree: repeated quiet
+    // turns, material accumulation, and actual danger/weak visible progress.
+    // This deliberately leaves normal GTR construction and safe low-chain
+    // games alone.
+    const bool danger =
+        n.currentDangerHeight >= 10 || n.currentMaxHeight >= 11 ||
+        (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 8);
+    if (!danger || n.quietTurns < 6 || n.occupiedGrowth < 8) return 0.0;
+    if (n.bestTriggerPath >= 3 || n.productiveFollowupMoves >= 3) return 0.0;
+
+    double penalty = -3500.0;
+    if (n.quietTurns >= 9) penalty -= 2500.0;
+    if (n.occupiedGrowth >= 14) penalty -= 2500.0;
+    if (n.bestImmediateChains == 0 && n.bestFollowupChains == 0) penalty -= 1500.0;
+    return std::max(penalty, -10000.0);
+}
+
 double finalUtility(const Node& n) {
     // Virtual potential is a test of whether the current construction still
-    // has an actual route to a chain.  Route/structure/construction scores are
-    // useful only while that viability is intact. Without this gate, the AI
-    // can keep rewarding a visually convincing "long-chain shape" after its
-    // firing path has already disappeared.
+    // has an actual route to a chain. Route/structure/construction scores are
+    // useful only while that viability is intact.
     const double survival = survivalCorrection(n);
 
     double constructionGate = 1.0;
@@ -638,12 +810,8 @@ double finalUtility(const Node& n) {
         else if (n.virtualPotential < 60000.0) constructionGate = 0.84;
     }
 
-    // When virtual firepower is weak, a real trigger-transfer path is the
-    // preferred recovery signal. It prevents "safe but short" construction
-    // from winning merely because it has a pleasant static shape.
     const double viability = n.hasTriggerViability
-        ? n.triggerViabilityScore
-        : 0.0;
+        ? n.triggerViabilityScore : 0.0;
 
     const double gatedConstruction =
         (static_cast<double>(n.mainChain.length()) * 16000.0 +
@@ -651,10 +819,6 @@ double finalUtility(const Node& n) {
          n.construction * 0.06 -
          n.prematureRisk * 0.06) * constructionGate;
 
-    // When the actual visible pair has no way to start a chain, do not let an
-    // arbitrary-pair virtual probe masquerade as real firing power.  The
-    // penalty is strongest in the danger zone and is intentionally small on
-    // healthy boards.
     double trueTriggerAdjustment = 0.0;
     if (n.trueTriggerMoves == 0 && n.trueImmediateChains == 0) {
         if (n.worstFutureSafeMoves <= 3 || n.worstNext2SafeMoves <= 1)
@@ -665,26 +829,16 @@ double finalUtility(const Node& n) {
     if (n.trueTriggerPath >= 3) trueTriggerAdjustment += 9000.0;
     else if (n.trueTriggerPath >= 2) trueTriggerAdjustment += 3500.0;
 
-    // Reward real, visible-piece chain progress rather than merely having a
-    // visually plausible construction.  The signal is deliberately small
-    // compared with an actual chain and is gated by the existence of a safe
-    // route, so it cannot turn the AI into a one-step "cash out" policy.
-    double progressAdjustment = 0.0;
-    if (n.bestTriggerPath >= 3) progressAdjustment += 7500.0;
-    else if (n.bestTriggerPath >= 2) progressAdjustment += 3000.0;
-    if (n.bestImmediateChains == 0 && n.bestFollowupChains == 0) {
-        if (n.worstFutureSafeMoves <= 3 || n.worstNext2SafeMoves <= 1)
-            progressAdjustment -= 6500.0;
-        else if (n.worstFutureSafeMoves <= 5)
-            progressAdjustment -= 1200.0;
-    }
-    if (n.productiveNextMoves > 0)
-        progressAdjustment += std::min(2500.0, 500.0 * n.productiveNextMoves);
-    if (n.productiveFollowupMoves > 0)
-        progressAdjustment += std::min(2000.0, 250.0 * n.productiveFollowupMoves);
+    const double progress = progressUtility(n);
+    const double recovery = recoveryUtility(n);
+    const double rebuild = rebuildUtility(n);
+    const double stagnation = stagnationUtility(n);
 
     return n.score + static_cast<double>(n.maxChain) * 25000.0
-         + progressAdjustment
+         + progress
+         + recovery
+         + rebuild
+         + stagnation
          + n.virtualPotential
          + gatedConstruction
          + viability * (constructionGate < 0.65 ? 0.72 : 0.22)
@@ -731,6 +885,10 @@ Move chooseRoot(
     root.features = extractStaticFeatures(board);
     root.hasFeatures = true;
     root.mainChain = analyzeMainChain(board);
+    const auto rootHeights = board.heights();
+    root.currentOccupied = std::accumulate(rootHeights.begin(), rootHeights.end(), 0);
+    root.currentMaxHeight = *std::max_element(rootHeights.begin(), rootHeights.end());
+    root.currentDangerHeight = rootHeights[2];
 
     std::vector<Node> beam = {root};
     std::unordered_map<SurvivalCacheKey, SurvivalHorizon, SurvivalCacheKeyHash> survivalCache;
@@ -948,6 +1106,11 @@ Move chooseRoot(
             oss << selected->mainChain.colors[i];
         }
         oss << " mainContinuity=" << selected->mainChainScore
+            << " progressScore=" << progressUtility(*selected)
+            << " recoveryScore=" << recoveryUtility(*selected)
+            << " rebuildScore=" << rebuildUtility(*selected)
+            << " stagnationScore=" << stagnationUtility(*selected)
+            << " survivalScore=" << survivalCorrection(*selected)
             << " gameOver=" << (selected->gameOver ? 1 : 0) << "\n"
             << "[AI-DEBUG] selected board (top->bottom):\n"
             << debugBoard(selected->board);
