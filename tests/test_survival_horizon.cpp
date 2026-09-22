@@ -43,6 +43,14 @@ int main() {
     assert(trigger.trueImmediateChains >= 1);
     assert(trigger.trueTriggerMoves >= 1);
     assert(trigger.trueTriggerPath >= 1);
+    // Recovery diagnostics must recognize that a visible move can actually
+    // clear a substantial amount of material and leave a healthy follow-up
+    // horizon. This is distinct from merely having a high theoretical path.
+    const auto recovery = analyzeSurvivalHorizon(triggerBoard, &triggerNext, &nextNext);
+    assert(recovery.bestImmediateNetClear >= 1);
+    assert(recovery.bestImmediatePostSafeMoves > 0);
+    assert(recovery.bestImmediatePostMaxHeight < VISIBLE_HEIGHT);
+    assert(recovery.bestFollowupNetClear >= 1);
 
     std::cout << "survival horizon tests passed\n";
     return 0;
