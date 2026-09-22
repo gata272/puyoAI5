@@ -76,6 +76,11 @@ struct Node {
     int trueFollowupChains = 0;
     int trueTriggerMoves = 0;
     int trueFollowupSafeMoves = 0;
+    int productiveNextMoves = 0;
+    int productiveFollowupMoves = 0;
+    int bestImmediateChains = 0;
+    int bestFollowupChains = 0;
+    int bestTriggerPath = 0;
 
     bool gameOver = false;
     std::uint64_t boardHash = 0;
@@ -212,6 +217,11 @@ std::vector<Node> expandNode(
         candidate.trueFollowupChains = 0;
         candidate.trueTriggerMoves = 0;
         candidate.trueFollowupSafeMoves = 0;
+        candidate.productiveNextMoves = 0;
+        candidate.productiveFollowupMoves = 0;
+        candidate.bestImmediateChains = 0;
+        candidate.bestFollowupChains = 0;
+        candidate.bestTriggerPath = 0;
         candidate.gameOver = deathMove;
 
         if (deathMove) death.push_back(std::move(candidate));
@@ -257,7 +267,20 @@ double survivalCorrection(const Node& n) {
 // narrow point can reject a construction that recovers on the next visible
 // placement, and the resulting early choices caused much earlier collapse.
 double beamUtility(const Node& n) {
-    return n.score + survivalCorrection(n);
+    // A small construction-progress signal is allowed into intermediate beam
+    // pruning. Without it, a route that is physically safe but has no visible
+    // way to fire/continue can disappear before the more expensive terminal
+    // structural evaluation sees it. Keep this deliberately smaller than the
+    // final progress correction so actual chain reward and survival remain the
+    // dominant ranking signals.
+    double progress = 0.0;
+    if (n.bestTriggerPath >= 3) progress += 4500.0;
+    else if (n.bestTriggerPath >= 2) progress += 1800.0;
+    if (n.bestImmediateChains == 0 && n.bestFollowupChains == 0 &&
+        (n.worstFutureSafeMoves <= 3 || n.worstNext2SafeMoves <= 1)) {
+        progress -= 3000.0;
+    }
+    return n.score + survivalCorrection(n) + progress;
 }
 
 bool betterForBeam(const Node& a, const Node& b) {
@@ -433,6 +456,11 @@ void applySurvivalProbe(
         node.trueFollowupChains = h.trueFollowupChains;
         node.trueTriggerMoves = h.trueTriggerMoves;
         node.trueFollowupSafeMoves = h.trueFollowupSafeMoves;
+        node.productiveNextMoves = h.productiveNextMoves;
+        node.productiveFollowupMoves = h.productiveFollowupMoves;
+        node.bestImmediateChains = h.bestImmediateChains;
+        node.bestFollowupChains = h.bestFollowupChains;
+        node.bestTriggerPath = h.bestTriggerPath;
 
         // Preserve the worst point reached anywhere on the path.  A branch
         // that briefly reaches zero/one safe move is dangerous even if the
@@ -460,6 +488,47 @@ void applySurvivalProbe(
     }
 }
 
+
+void applyProgressProbe(
+    std::vector<Node>& candidates,
+    const std::vector<PuyoPair>& pieces,
+    int depth,
+    int probeLimit,
+    std::unordered_map<SurvivalCacheKey, SurvivalHorizon, SurvivalCacheKeyHash>& cache
+) {
+    if (candidates.empty() || probeLimit <= 0 || depth >= static_cast<int>(pieces.size())) return;
+    const PuyoPair* next = &pieces[static_cast<std::size_t>(depth)];
+    const PuyoPair* nextNext = (depth + 1 < static_cast<int>(pieces.size()))
+        ? &pieces[static_cast<std::size_t>(depth + 1)] : nullptr;
+    const int n = std::min(probeLimit, static_cast<int>(candidates.size()));
+    for (int i = 0; i < n; ++i) {
+        Node& node = candidates[static_cast<std::size_t>(i)];
+        const SurvivalCacheKey key{
+            node.boardHash,
+            static_cast<std::uint16_t>((static_cast<int>(next->main) << 8) |
+                                       static_cast<int>(next->sub)),
+            nextNext
+                ? static_cast<std::uint16_t>((static_cast<int>(nextNext->main) << 8) |
+                                             static_cast<int>(nextNext->sub))
+                : static_cast<std::uint16_t>(0)
+        };
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            it = cache.emplace(key, analyzeSurvivalHorizon(node.board, next, nextNext)).first;
+        }
+        const SurvivalHorizon& h = it->second;
+        node.trueTriggerPath = h.trueTriggerPath;
+        node.trueImmediateChains = h.trueImmediateChains;
+        node.trueFollowupChains = h.trueFollowupChains;
+        node.trueTriggerMoves = h.trueTriggerMoves;
+        node.trueFollowupSafeMoves = h.trueFollowupSafeMoves;
+        node.productiveNextMoves = h.productiveNextMoves;
+        node.productiveFollowupMoves = h.productiveFollowupMoves;
+        node.bestImmediateChains = h.bestImmediateChains;
+        node.bestFollowupChains = h.bestFollowupChains;
+        node.bestTriggerPath = h.bestTriggerPath;
+    }
+}
 
 void applyVirtualRerank(std::vector<Node>& beam, int topM) {
     if (beam.empty() || topM <= 0) return;
@@ -539,6 +608,11 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " trueFollow=" << x.trueFollowupChains
             << " trueTrigMoves=" << x.trueTriggerMoves
             << " trueFollowSafe=" << x.trueFollowupSafeMoves
+            << " prodNext=" << x.productiveNextMoves
+            << " prodFollow=" << x.productiveFollowupMoves
+            << " bestNow=" << x.bestImmediateChains
+            << " bestFollow=" << x.bestFollowupChains
+            << " bestPath=" << x.bestTriggerPath
             << " rootSafe=" << x.rootFutureSafeMoves
             << " structure=" << x.structure
             << " mainChain=" << x.mainChain.length()
@@ -591,7 +665,26 @@ double finalUtility(const Node& n) {
     if (n.trueTriggerPath >= 3) trueTriggerAdjustment += 9000.0;
     else if (n.trueTriggerPath >= 2) trueTriggerAdjustment += 3500.0;
 
+    // Reward real, visible-piece chain progress rather than merely having a
+    // visually plausible construction.  The signal is deliberately small
+    // compared with an actual chain and is gated by the existence of a safe
+    // route, so it cannot turn the AI into a one-step "cash out" policy.
+    double progressAdjustment = 0.0;
+    if (n.bestTriggerPath >= 3) progressAdjustment += 7500.0;
+    else if (n.bestTriggerPath >= 2) progressAdjustment += 3000.0;
+    if (n.bestImmediateChains == 0 && n.bestFollowupChains == 0) {
+        if (n.worstFutureSafeMoves <= 3 || n.worstNext2SafeMoves <= 1)
+            progressAdjustment -= 6500.0;
+        else if (n.worstFutureSafeMoves <= 5)
+            progressAdjustment -= 1200.0;
+    }
+    if (n.productiveNextMoves > 0)
+        progressAdjustment += std::min(2500.0, 500.0 * n.productiveNextMoves);
+    if (n.productiveFollowupMoves > 0)
+        progressAdjustment += std::min(2000.0, 250.0 * n.productiveFollowupMoves);
+
     return n.score + static_cast<double>(n.maxChain) * 25000.0
+         + progressAdjustment
          + n.virtualPotential
          + gatedConstruction
          + viability * (constructionGate < 0.65 ? 0.72 : 0.22)
@@ -670,6 +763,11 @@ Move chooseRoot(
         // smaller top-M budget.
         if (depth == 0) {
             applyVirtualRerank(next, std::min(12, activeBeamWidth));
+            // Chain-progress probe uses only visible next/next-next pairs and
+            // is evaluated for every root child so low-chain routes cannot be
+            // discarded solely because they are still physically healthy.
+            applyProgressProbe(next, pieces, depth + 1,
+                               std::min(12, static_cast<int>(next.size())), survivalCache);
             // The first move is too important to sample only the top-scoring
             // half of the legal placements.  Probe every root child so a
             // survival-safe chain-preserving move cannot disappear before the
@@ -719,6 +817,12 @@ Move chooseRoot(
             // This is a multi-objective beam: chain construction keeps its
             // normal score, while survival gets a chance to reserve an escape
             // route.  On low boards we retain the old cheap top-M probe.
+            const int progressLimit = std::min(6, static_cast<int>(next.size()));
+            std::sort(next.begin(), next.end(), [](const Node& a, const Node& b) {
+                return beamUtility(a) > beamUtility(b);
+            });
+            applyProgressProbe(next, pieces, depth + 1, progressLimit, survivalCache);
+
             const int probeLimit = dangerPresent
                 ? static_cast<int>(next.size())
                 : std::min(12, activeBeamWidth);
@@ -760,6 +864,7 @@ Move chooseRoot(
     // analysis only to the strongest virtual candidates.
     applyVirtualRerank(beam, std::min(18, static_cast<int>(beam.size())));
     if (horizon < static_cast<int>(pieces.size())) {
+        applyProgressProbe(beam, pieces, horizon, static_cast<int>(beam.size()), survivalCache);
         applySurvivalProbe(beam, pieces, horizon, static_cast<int>(beam.size()), survivalCache);
     }
     std::sort(beam.begin(), beam.end(), [](const Node& a, const Node& b) {
