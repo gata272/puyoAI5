@@ -52,6 +52,10 @@ struct Node {
     int previousFutureGeometricMoves = -1;
     int rootFutureSafeMoves = -1;
     double rootSurvivalScore = 0.0;
+    int rootImmediateChains = 0;
+    int rootImmediateErased = 0;
+    int rootImmediatePostOccupied = 0;
+    int rootImmediatePostMaxHeight = 0;
     bool hasRootSurvival = false;
     int futureGeometricMoves = -1;
     int bestNextGeometricMoves = -1;
@@ -80,6 +84,8 @@ struct Node {
     int productiveNextMoves = 0;
     int productiveFollowupMoves = 0;
     int bestImmediateChains = 0;
+    int bestImmediateErased = 0;
+    int bestImmediatePostOccupied = BOARD_WIDTH * VISIBLE_HEIGHT;
     int bestFollowupChains = 0;
     int bestTriggerPath = 0;
     int bestImmediateNetClear = 0;
@@ -122,6 +128,16 @@ struct PolicyContext {
     int rootOccupied = 0;
     int rootMaxHeight = 0;
     int rootDangerHeight = 0;
+    int rootImmediateChains = 0;
+    int rootImmediateErased = 0;
+    int rootBestTriggerPath = 0;
+    int rootBestFollowupChains = 0;
+    int rootBestImmediateNetClear = 0;
+    int rootBestFollowupNetClear = 0;
+    int rootBestPostSafeMoves = -1;
+    int rootClearDebt = 0;
+    bool accumulation = false;
+    bool rebuildReady = false;
     bool tension = false;
     bool recovery = false;
 };
@@ -189,15 +205,33 @@ PolicyContext makePolicyContext(
     policy.rootOccupied = std::accumulate(heights.begin(), heights.end(), 0);
     policy.rootMaxHeight = *std::max_element(heights.begin(), heights.end());
     policy.rootDangerHeight = heights[2];
+    policy.rootClearDebt = history.clearDebtScore();
 
+    SurvivalHorizon rootHorizon;
     if (!pieces.empty()) {
         const PuyoPair* next = &pieces[0];
         const PuyoPair* nextNext = pieces.size() > 1 ? &pieces[1] : nullptr;
-        const SurvivalHorizon rootHorizon =
-            analyzeSurvivalHorizon(board, next, nextNext);
+        rootHorizon = analyzeSurvivalHorizon(board, next, nextNext);
         policy.rootSafeMoves = rootHorizon.safeMoves;
         policy.rootGeometricMoves = rootHorizon.geometricMoves;
+        policy.rootImmediateChains = rootHorizon.bestImmediateChains;
+        policy.rootImmediateErased = rootHorizon.bestImmediateErased;
+        policy.rootBestTriggerPath = rootHorizon.bestTriggerPath;
+        policy.rootBestFollowupChains = rootHorizon.bestFollowupChains;
+        policy.rootBestImmediateNetClear = rootHorizon.bestImmediateNetClear;
+        policy.rootBestFollowupNetClear = rootHorizon.bestFollowupNetClear;
+        policy.rootBestPostSafeMoves = rootHorizon.bestImmediatePostSafeMoves;
     }
+
+    // This is deliberately based on actual clearing history, not on
+    // hypothetical chain events inside the search tree. It catches the
+    // long-quiet accumulation states found in the fixed-seed logs while still
+    // leaving low-chain/high-throughput survivor games alone.
+    policy.accumulation =
+        policy.rootOccupied >= 52 &&
+        history.meaningfulClearAge >= 6 &&
+        (history.occupiedGrowthSinceMeaningfulClear >= 8 ||
+         policy.rootClearDebt >= 24);
 
     const bool emergency =
         (policy.rootSafeMoves >= 0 && policy.rootSafeMoves <= 5 &&
@@ -210,18 +244,33 @@ PolicyContext makePolicyContext(
         policy.rootOccupied >= 56 ||
         policy.rootMaxHeight >= 11 ||
         (policy.rootSafeMoves >= 0 && policy.rootSafeMoves <= 9) ||
-        (policy.history.quietTurns >= 3 &&
-         policy.history.occupiedGrowthSinceChain >= 4);
+        (policy.accumulation && policy.rootOccupied >= 52);
 
     policy.recovery =
         emergency ||
-        (policy.history.quietTurns >= 4 &&
-         policy.history.occupiedGrowthSinceChain >= 6 &&
-         policy.rootSafeMoves >= 0 && policy.rootSafeMoves <= 8);
+        (policy.accumulation &&
+         policy.rootOccupied >= 52 &&
+         (policy.rootSafeMoves < 0 ||
+          policy.rootSafeMoves <= 14 ||
+          policy.rootClearDebt >= 36)) ||
+        (policy.rootOccupied >= 62 && policy.rootClearDebt >= 28);
+
+    // REBUILD is entered after a real 4+ chain, but it should end when the
+    // visible pieces actually expose a plausible next trigger path. The age
+    // limit is only a safety cap, not the normal exit condition.
+    if (history.inRebuild()) {
+        policy.rebuildReady =
+            rootHorizon.bestTriggerPath >= 3 ||
+            (rootHorizon.bestTriggerPath >= 2 &&
+             (rootHorizon.bestFollowupChains >= 1 ||
+              rootHorizon.productiveFollowupMoves >= 1)) ||
+            (rootHorizon.trueImmediateChains >= 1 &&
+             rootHorizon.bestFollowupChains >= 1);
+    }
 
     if (policy.recovery) {
         policy.mode = PolicyMode::Recover;
-    } else if (history.inRebuild()) {
+    } else if (history.inRebuild() && !policy.rebuildReady) {
         policy.mode = PolicyMode::Rebuild;
     } else if (policy.tension) {
         policy.mode = PolicyMode::Tension;
@@ -325,6 +374,10 @@ std::vector<Node> expandNode(
         candidate.board = sim.board;
         candidate.boardHash = fastBoardHash(candidate.board);
         candidate.root = parent.root.valid ? parent.root : move;
+        if (!parent.root.valid) {
+            candidate.rootImmediateChains = sim.chains;
+            candidate.rootImmediateErased = std::max(0, sim.erased);
+        }
         candidate.maxChain = std::max(parent.maxChain, sim.chains);
         // Route/main-chain analysis is intentionally deferred to the terminal
         // beam. Those routines perform hypothetical chain resolutions and are
@@ -341,6 +394,10 @@ std::vector<Node> expandNode(
         candidate.previousFutureGeometricMoves = parent.hasSurvival ? parent.futureGeometricMoves : -1;
         candidate.rootFutureSafeMoves = parent.rootFutureSafeMoves;
         candidate.rootSurvivalScore = parent.rootSurvivalScore;
+        candidate.rootImmediateChains = parent.rootImmediateChains;
+        candidate.rootImmediateErased = parent.rootImmediateErased;
+        candidate.rootImmediatePostOccupied = parent.rootImmediatePostOccupied;
+        candidate.rootImmediatePostMaxHeight = parent.rootImmediatePostMaxHeight;
         candidate.hasRootSurvival = parent.hasRootSurvival;
         candidate.futureGeometricMoves = -1;
         candidate.bestNextGeometricMoves = -1;
@@ -363,6 +420,8 @@ std::vector<Node> expandNode(
         candidate.productiveNextMoves = parent.productiveNextMoves;
         candidate.productiveFollowupMoves = parent.productiveFollowupMoves;
         candidate.bestImmediateChains = parent.bestImmediateChains;
+        candidate.bestImmediateErased = parent.bestImmediateErased;
+        candidate.bestImmediatePostOccupied = parent.bestImmediatePostOccupied;
         candidate.bestFollowupChains = parent.bestFollowupChains;
         candidate.bestTriggerPath = parent.bestTriggerPath;
         candidate.bestImmediateNetClear = parent.bestImmediateNetClear;
@@ -383,6 +442,10 @@ std::vector<Node> expandNode(
         candidate.currentMaxHeight = *std::max_element(
             childHeights.begin(), childHeights.end());
         candidate.currentDangerHeight = childHeights[2];
+        if (!parent.root.valid) {
+            candidate.rootImmediatePostOccupied = candidate.currentOccupied;
+            candidate.rootImmediatePostMaxHeight = candidate.currentMaxHeight;
+        }
         candidate.lastChains = sim.chains;
         // These are path-local diagnostics only. Actual TENSION/RECOVER/REBUILD
         // state comes from GameHistory in the real game, never from hypothetical
@@ -468,10 +531,6 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth, const PolicyContext
     std::vector<Node> selected;
     selected.reserve(static_cast<std::size_t>(beamWidth));
 
-    // First reserve a small number of genuinely safer states when the
-    // frontier is entering the danger zone.  This is deliberately bounded:
-    // chain-building states still occupy most of the beam, but one heuristic
-    // mistake cannot erase every escape route at once.
     bool dangerPresent = false;
     for (const auto& node : candidates) {
         const auto h = node.board.heights();
@@ -481,9 +540,29 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth, const PolicyContext
         }
     }
 
-    if (dangerPresent) {
+    auto addUnique = [&](const Node* node) {
+        if (!node || static_cast<int>(selected.size()) >= beamWidth) return;
+        for (const auto& existing : selected) {
+            if (existing.boardHash == node->boardHash) return;
+        }
+        selected.push_back(*node);
+    };
+
+    // Separate reserves are intentional: the previous implementation used
+    // the same absolute selected-size target for survival and recovery, so a
+    // full survival reserve could silently eliminate the recovery reserve.
+    const int safetyReserve = dangerPresent
+        ? std::min(std::max(1, beamWidth / 5), beamWidth)
+        : 0;
+    int recoveryReserve = 0;
+    if (policy.recovery || policy.mode == PolicyMode::Rebuild) {
+        recoveryReserve = std::min(
+            std::max(1, beamWidth / 4),
+            std::max(0, beamWidth - safetyReserve));
+    }
+
+    if (safetyReserve > 0) {
         std::vector<const Node*> safety;
-        safety.reserve(candidates.size());
         for (const auto& node : candidates) {
             if (node.hasSurvival) safety.push_back(&node);
         }
@@ -496,91 +575,82 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth, const PolicyContext
             if (a->maxChain != b->maxChain) return a->maxChain > b->maxChain;
             return a->score > b->score;
         });
-
-        // At most a quarter of the beam is a survival reserve.  Prefer
-        // chain-preserving survivors when the safety values are equal.
-        const int reserve = std::min(
-            std::max(1, beamWidth / 4), beamWidth);
         for (const Node* node : safety) {
-            if (static_cast<int>(selected.size()) >= reserve) break;
-            bool duplicate = false;
-            for (const auto& existing : selected) {
-                if (existing.boardHash == node->boardHash) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) selected.push_back(*node);
+            if (static_cast<int>(selected.size()) >= safetyReserve) break;
+            addUnique(node);
         }
     }
 
-    if (policy.recovery || policy.mode == PolicyMode::Rebuild) {
+    if (recoveryReserve > 0) {
         std::vector<const Node*> recovery;
         recovery.reserve(candidates.size());
         for (const auto& node : candidates) {
             const int truePath = nodeTruePath(node);
-            if (node.bestImmediatePostSafeMoves >= 0 ||
+            const bool productive =
+                node.rootImmediateErased > 0 ||
+                node.bestImmediateNetClear > 0 ||
                 node.bestFollowupNetClear > 0 ||
-                truePath > 0) {
-                recovery.push_back(&node);
-            }
+                node.bestFollowupChains > 0 ||
+                truePath >= 2;
+            if (productive) recovery.push_back(&node);
         }
         std::sort(recovery.begin(), recovery.end(), [](const Node* a, const Node* b) {
             const double av =
+                1000.0 * std::max(0, a->rootImmediateErased) +
+                2500.0 * std::max(0, a->rootImmediateChains) +
                 450.0 * std::max(0, a->bestImmediateNetClear) +
-                360.0 * std::max(0, a->bestFollowupNetClear) +
-                900.0 * std::max(0, a->bestImmediatePostSafeMoves) +
-                1200.0 * nodeTruePath(*a) +
-                500.0 * std::max(0, a->rootFutureSafeMoves);
+                420.0 * std::max(0, a->bestFollowupNetClear) +
+                800.0 * std::max(0, a->bestImmediatePostSafeMoves) +
+                1400.0 * nodeTruePath(*a) +
+                450.0 * std::max(0, a->rootFutureSafeMoves) +
+                350.0 * std::max(0, a->maxChain);
             const double bv =
+                1000.0 * std::max(0, b->rootImmediateErased) +
+                2500.0 * std::max(0, b->rootImmediateChains) +
                 450.0 * std::max(0, b->bestImmediateNetClear) +
-                360.0 * std::max(0, b->bestFollowupNetClear) +
-                900.0 * std::max(0, b->bestImmediatePostSafeMoves) +
-                1200.0 * nodeTruePath(*b) +
-                500.0 * std::max(0, b->rootFutureSafeMoves);
+                420.0 * std::max(0, b->bestFollowupNetClear) +
+                800.0 * std::max(0, b->bestImmediatePostSafeMoves) +
+                1400.0 * nodeTruePath(*b) +
+                450.0 * std::max(0, b->rootFutureSafeMoves) +
+                350.0 * std::max(0, b->maxChain);
             if (av != bv) return av > bv;
             return a->score > b->score;
         });
-        const int reserve = std::min(std::max(1, beamWidth / 3), beamWidth);
         for (const Node* node : recovery) {
-            if (static_cast<int>(selected.size()) >= reserve) break;
-            bool duplicate = false;
-            for (const auto& existing : selected) {
-                if (existing.boardHash == node->boardHash) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (!duplicate) selected.push_back(*node);
+            if (static_cast<int>(selected.size()) >= safetyReserve + recoveryReserve) break;
+            addUnique(node);
         }
     }
 
-    // Keep a small root-action diversity reserve. This prevents one attractive
-    // first move from occupying the entire beam before virtual-fire refinement.
-    const int diversitySlots = std::min(6, beamWidth);
+    // Preserve at least the six-root diversity used by the previous stable
+    // search in ordinary BUILD turns. Recovery/survival reserves may occupy
+    // some slots first; in that case keep a few additional distinct roots,
+    // but do not let diversity crowd out the dedicated rescue candidates.
+    const int baseDiversitySlots = std::min(6, beamWidth);
+    const int diversityTarget = std::min(
+        beamWidth,
+        std::max(
+            baseDiversitySlots,
+            static_cast<int>(selected.size()) + std::min(4, beamWidth)));
     bool seenRoot[BOARD_WIDTH][4]{};
-    for (const auto& node : candidates) {
-        if (static_cast<int>(selected.size()) >= diversitySlots) break;
+    for (const auto& node : selected) {
         if (node.root.valid && node.root.x >= 0 && node.root.x < BOARD_WIDTH &&
-            node.root.rotation >= 0 && node.root.rotation < 4 &&
-            !seenRoot[node.root.x][node.root.rotation]) {
+            node.root.rotation >= 0 && node.root.rotation < 4) {
             seenRoot[node.root.x][node.root.rotation] = true;
-            selected.push_back(node);
         }
     }
     for (const auto& node : candidates) {
+        if (static_cast<int>(selected.size()) >= diversityTarget) break;
+        if (!node.root.valid || node.root.x < 0 || node.root.x >= BOARD_WIDTH ||
+            node.root.rotation < 0 || node.root.rotation >= 4 ||
+            seenRoot[node.root.x][node.root.rotation]) continue;
+        seenRoot[node.root.x][node.root.rotation] = true;
+        addUnique(&node);
+    }
+
+    for (const auto& node : candidates) {
         if (static_cast<int>(selected.size()) >= beamWidth) break;
-        bool duplicate = false;
-        for (const auto& existing : selected) {
-            if (existing.root.x == node.root.x &&
-                existing.root.rotation == node.root.rotation &&
-                existing.score == node.score &&
-                existing.maxChain == node.maxChain) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) selected.push_back(node);
+        addUnique(&node);
     }
     candidates.swap(selected);
 }
@@ -670,6 +740,8 @@ void applySurvivalProbe(
         node.productiveNextMoves = h.productiveNextMoves;
         node.productiveFollowupMoves = h.productiveFollowupMoves;
         node.bestImmediateChains = h.bestImmediateChains;
+        node.bestImmediateErased = h.bestImmediateErased;
+        node.bestImmediatePostOccupied = h.bestImmediatePostOccupied;
         node.bestFollowupChains = h.bestFollowupChains;
         node.bestTriggerPath = h.bestTriggerPath;
         node.bestImmediateNetClear = h.bestImmediateNetClear;
@@ -744,6 +816,8 @@ void applyProgressProbe(
         node.productiveNextMoves = h.productiveNextMoves;
         node.productiveFollowupMoves = h.productiveFollowupMoves;
         node.bestImmediateChains = h.bestImmediateChains;
+        node.bestImmediateErased = h.bestImmediateErased;
+        node.bestImmediatePostOccupied = h.bestImmediatePostOccupied;
         node.bestFollowupChains = h.bestFollowupChains;
         node.bestTriggerPath = h.bestTriggerPath;
         node.bestImmediateNetClear = h.bestImmediateNetClear;
@@ -898,14 +972,16 @@ double recoveryUtility(const Node& n, const PolicyContext& policy) {
     }
     const bool caution =
         danger || n.currentOccupied >= 56 ||
-        (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 13);
+        (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 13) ||
+        policy.accumulation;
 
     double score = 0.0;
-    // Net clearing is the safest way to distinguish a true recovery from a
-    // merely large-looking chain. Keep this term modest on healthy boards.
     if (caution) {
-        score += std::min(24, n.bestImmediateNetClear) * (danger ? 650.0 : 300.0);
-        score += std::min(24, n.bestFollowupNetClear) * (danger ? 450.0 : 180.0);
+        score += std::min(28, n.bestImmediateNetClear) * (danger ? 650.0 : 320.0);
+        score += std::min(28, n.bestFollowupNetClear) * (danger ? 450.0 : 200.0);
+        score += std::min(24, n.rootImmediateErased) * (danger ? 700.0 : 280.0);
+        if (n.rootImmediateChains >= 4) score += 3000.0;
+        else if (n.rootImmediateChains >= 2) score += 1200.0;
         if (n.bestImmediatePostSafeMoves >= 0) {
             score += std::clamp(
                 static_cast<double>(n.bestImmediatePostSafeMoves - 6) *
@@ -920,29 +996,37 @@ double recoveryUtility(const Node& n, const PolicyContext& policy) {
         }
     }
 
-    // Do not globally reward firing. A large immediate chain is valuable as a
-    // recovery only when the board is already entering the danger zone.
     if (danger) {
         if (n.bestImmediateChains >= 6) score += 3500.0;
         else if (n.bestImmediateChains >= 4) score += 1800.0;
         if (n.bestFollowupChains >= 4) score += 2200.0;
         else if (n.bestFollowupChains >= 2) score += 900.0;
     }
-    return std::clamp(score, -6000.0, 18000.0);
+    return std::clamp(score, -7000.0, 22000.0);
 }
 
 double rebuildUtility(const Node& n, const PolicyContext& policy) {
     if (policy.mode != PolicyMode::Rebuild) return 0.0;
 
     double score = 0.0;
-    if (n.bestRebuildChain >= 4) score += 7000.0;
-    else if (n.bestRebuildChain >= 2) score += 4200.0;
-    else if (n.bestRebuildChain >= 1) score += 1200.0;
+    if (n.bestTriggerPath >= 4) score += 6500.0;
+    else if (n.bestTriggerPath >= 3) score += 4800.0;
+    else if (n.bestTriggerPath >= 2) score += 2500.0;
 
-    score += std::min(20, n.bestRebuildNetClear) * 280.0;
+    if (n.bestFollowupChains >= 3) score += 5000.0;
+    else if (n.bestFollowupChains >= 2) score += 3200.0;
+    else if (n.bestFollowupChains >= 1) score += 1200.0;
+
+    if (n.bestRebuildChain >= 4) score += 6000.0;
+    else if (n.bestRebuildChain >= 2) score += 3000.0;
+    else if (n.bestRebuildChain >= 1) score += 1000.0;
+
+    score += std::min(24, n.bestRebuildNetClear) * 300.0;
+    score += std::min(20, n.rootImmediateErased) * 220.0;
+
     if (n.bestRebuildNextSafeMoves >= 0) {
         score += std::clamp(
-            static_cast<double>(n.bestRebuildNextSafeMoves - 6) * 280.0,
+            static_cast<double>(n.bestRebuildNextSafeMoves - 6) * 260.0,
             -1200.0, 3000.0);
     }
 
@@ -950,32 +1034,42 @@ double rebuildUtility(const Node& n, const PolicyContext& policy) {
                         n.currentMaxHeight >= 11 ||
                         n.currentOccupied >= 60 ||
                         (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 9);
-    if (danger && n.bestRebuildChain == 0 && n.bestImmediateChains == 0) {
-        score -= 3500.0;
+    if (danger && n.bestTriggerPath < 2 &&
+        n.bestFollowupChains == 0 && n.rootImmediateErased == 0) {
+        score -= 3000.0;
     }
-    return std::clamp(score, -5000.0, 13000.0);
+    if (policy.history.postBigChainAge >= 6 && !policy.rebuildReady) {
+        score += 2200.0;
+    }
+    if (policy.rebuildReady) score += 2500.0;
+    return std::clamp(score, -6500.0, 18000.0);
 }
 
 double stagnationUtility(const Node& n, const PolicyContext& policy) {
-    // Stagnation is only penalized when three signals agree: repeated quiet
-    // turns, material accumulation, and actual danger/weak visible progress.
-    // This deliberately leaves normal GTR construction and safe low-chain
-    // games alone.
     const bool danger =
         n.currentDangerHeight >= 10 || n.currentMaxHeight >= 11 ||
         n.currentOccupied >= 60 ||
         (n.futureSafeMoves >= 0 && n.futureSafeMoves <= 8);
-    if (!danger) return 0.0;
-    if (policy.history.quietTurns < 4 ||
-        policy.history.occupiedGrowthSinceChain < 6 ||
-        policy.history.recentChainCount > 0) return 0.0;
-    if (nodeTruePath(n) >= 3 || n.productiveFollowupMoves >= 3) return 0.0;
+    if (!danger && !policy.accumulation) return 0.0;
 
-    double penalty = -3500.0;
-    if (policy.history.quietTurns >= 8) penalty -= 2500.0;
-    if (policy.history.occupiedGrowthSinceChain >= 12) penalty -= 2500.0;
-    if (n.bestImmediateChains == 0 && n.bestFollowupChains == 0) penalty -= 1500.0;
-    return std::max(penalty, -10000.0);
+    const GameHistory& h = policy.history;
+    if (h.meaningfulClearAge < 5 ||
+        h.occupiedGrowthSinceMeaningfulClear < 6) return 0.0;
+
+    // A chronically accumulated board should gently prefer productive escape
+    // routes. This is intentionally weaker than the long-chain reward.
+    double penalty = -2200.0;
+    if (h.meaningfulClearAge >= 8) penalty -= 1800.0;
+    if (h.meaningfulClearAge >= 12) penalty -= 1800.0;
+    if (h.occupiedGrowthSinceMeaningfulClear >= 12) penalty -= 2200.0;
+    if (h.occupiedGrowthSinceMeaningfulClear >= 24) penalty -= 1800.0;
+    if (h.recentClearPuyos >= 8) penalty += 1200.0;
+    if (h.recentMeaningfulClears > 0) penalty += 1000.0 * std::min(2, h.recentMeaningfulClears);
+    if (n.rootImmediateErased >= 8) penalty += 2500.0;
+    if (n.bestImmediateNetClear >= 8 || n.bestFollowupNetClear >= 8) penalty += 1800.0;
+    if (nodeTruePath(n) >= 3) penalty += 1600.0;
+    if (n.bestFollowupChains >= 2) penalty += 1600.0;
+    return std::clamp(penalty, -11000.0, 4000.0);
 }
 
 double finalUtility(const Node& n, const PolicyContext& policy) {
@@ -1023,17 +1117,27 @@ double finalUtility(const Node& n, const PolicyContext& policy) {
          (n.bestImmediatePostSafeMoves >= 0 && n.bestImmediatePostSafeMoves <= 8));
     const bool recoveryGate = n.recoveryActive || severeGap ||
                               policy.mode == PolicyMode::Rebuild;
+    const bool debtCollapse =
+        policy.accumulation &&
+        policy.history.occupiedGrowthSinceMeaningfulClear >= 16 &&
+        policy.history.meaningfulClearAge >= 8 &&
+        nodeTruePath(n) <= 2 &&
+        n.rootImmediateErased == 0 &&
+        n.bestFollowupChains == 0;
     const double recoveryConstructionScale =
         !recoveryGate ? 1.0 :
-        (n.theoreticalGap >= 8 && nodeTruePath(n) <= 2 ? 0.34 :
-         n.theoreticalGap >= 6 ? 0.52 : 0.78);
+        (debtCollapse ? 0.48 :
+         n.theoreticalGap >= 8 && nodeTruePath(n) <= 2 ? 0.60 :
+         n.theoreticalGap >= 6 ? 0.72 : 0.86);
 
     const double recoveryPriority = recoveryGate
         ? (1200.0 * std::max(0, nodeTruePath(n)) +
            520.0 * std::max(0, n.bestImmediateNetClear) +
            420.0 * std::max(0, n.bestFollowupNetClear) +
            900.0 * std::max(0, n.bestImmediatePostSafeMoves) +
-           360.0 * std::max(0, n.bestRebuildNetClear))
+           360.0 * std::max(0, n.bestRebuildNetClear) +
+           700.0 * std::max(0, n.rootImmediateErased) +
+           1800.0 * std::max(0, n.rootImmediateChains))
         : 0.0;
 
     return n.score + static_cast<double>(n.maxChain) * 25000.0
@@ -1310,12 +1414,16 @@ Move chooseRoot(
         // merely safe-looking placement over an immediately realizable 4+ chain.
         const bool severeRecovery =
             policy.mode == PolicyMode::Recover &&
-            (policy.rootSafeMoves <= 5 || best->theoreticalGap >= 6);
+            (policy.rootSafeMoves <= 5 ||
+             best->theoreticalGap >= 6 ||
+             policy.accumulation);
         const Node* chainEscape = selected;
         for (const auto& node : beam) {
             if (!node.root.valid || !node.hasRootSurvival) continue;
             const bool realChain = node.maxChain >= 4;
-            const bool enoughImmediateSpace = node.rootFutureSafeMoves >= 3;
+            const bool enoughImmediateSpace =
+                node.rootFutureSafeMoves >= 3 ||
+                node.rootImmediateErased >= GameHistory::kMeaningfulClearPuyos;
             const bool materiallyLargerChain =
                 node.maxChain >= best->maxChain + 3;
             const bool substantialClear =
@@ -1333,6 +1441,23 @@ Move chooseRoot(
         }
         if (severeRecovery && chainEscape != selected) {
             selected = chainEscape;
+        }
+
+        // During genuine accumulation, an actual meaningful root clear is a
+        // first-class escape route even when its immediate safe-move count is
+        // not the absolute maximum. Prefer it when it preserves reasonable
+        // mobility and does not sacrifice a materially larger chain.
+        if (policy.accumulation) {
+            for (const auto& node : beam) {
+                if (!node.root.valid) continue;
+                if (node.rootImmediateErased < GameHistory::kMeaningfulClearPuyos) continue;
+                if (node.rootFutureSafeMoves >= 0 && node.rootFutureSafeMoves < 2) continue;
+                if (node.maxChain + 1 < best->maxChain) continue;
+                if (node.rootImmediateErased > selected->rootImmediateErased ||
+                    node.rootImmediateChains > selected->rootImmediateChains) {
+                    selected = &node;
+                }
+            }
         }
 
         // Otherwise retain the conservative mobility-based rescue, but only
@@ -1406,6 +1531,20 @@ Move chooseRoot(
             << " histPostBigAge=" << policy.history.postBigChainAge
             << " recentChains=" << policy.history.recentChainCount
             << " recentClear=" << policy.history.recentClearPuyos
+            << " meaningfulAge=" << policy.history.meaningfulClearAge
+            << " meaningfulClears=" << policy.history.recentMeaningfulClears
+            << " meaningfulGrowth=" << policy.history.occupiedGrowthSinceMeaningfulClear
+            << " clearDebt=" << policy.rootClearDebt
+            << " accumulation=" << (policy.accumulation ? 1 : 0)
+            << " rebuildReady=" << (policy.rebuildReady ? 1 : 0)
+            << " rootNowChain=" << selected->rootImmediateChains
+            << " rootNowErased=" << selected->rootImmediateErased
+            << " rootPostOcc=" << selected->rootImmediatePostOccupied
+            << " rootBestPath=" << policy.rootBestTriggerPath
+            << " rootBestFollow=" << policy.rootBestFollowupChains
+            << " rootBestNetNow=" << policy.rootBestImmediateNetClear
+            << " rootBestNetFollow=" << policy.rootBestFollowupNetClear
+            << " rootBestPostSafe=" << policy.rootBestPostSafeMoves
             << " rootSafe=" << policy.rootSafeMoves
             << " gameOver=" << (selected->gameOver ? 1 : 0) << "\n"
             << "[AI-DEBUG] selected board (top->bottom):\n"
