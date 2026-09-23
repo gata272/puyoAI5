@@ -3,6 +3,7 @@
 #include <vector>
 #include "../simulation/board.h"
 #include "../evaluation/weights.h"
+#include "../evaluation/game_history.h"
 #include "move.h"
 
 namespace puyo {
@@ -14,7 +15,8 @@ public:
         const std::vector<PuyoPair>& pieces,
         const Weights& weights,
         int depth = 3,
-        int beamWidth = 8
+        int beamWidth = 8,
+        const GameHistory& history = GameHistory{}
     ) const;
 };
 
