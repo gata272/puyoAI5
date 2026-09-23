@@ -114,3 +114,33 @@ The implementation also keeps a bounded Recovery reserve in beam pruning. This i
 separate from the existing survival reserve so that a candidate with a modest
 current score but a strong visible recovery route can survive pruning without
 turning normal construction into a mobility-maximizing policy.
+
+## PuyoAI25: meaningful clearing, clear debt, and trigger-based REBUILD
+
+PuyoAI25 refines the lifecycle policy using the two fixed-seed log sets collected for PuyoAI24.
+The main observation was that Game Over was usually preceded by several turns of accumulation rather
+than by a single bad final placement. Low maximum-chain games could still survive when they cleared
+frequently, so maximum chain alone is not treated as a safety signal.
+
+The game-level history now distinguishes an arbitrary chain event from a meaningful clear. A single
+four-puyo 1-chain does not reset the meaningful-clear age. A clear of at least eight puyos, a 2+ chain,
+or an all-clear does. The history also records occupancy growth since the most recent meaningful clear,
+recent clear volume, recent meaningful clears, and a bounded clear-debt score.
+
+Recovery therefore targets productive clearing rather than safeMoves alone. Root candidates expose the
+actual chains/erased puyos/post-occupancy caused by the selected root move, separately from future visible-
+piece probes. During accumulation, a meaningful immediate clear is retained as a dedicated escape route
+when it does not destroy a materially larger chain or leave the root with effectively no mobility.
+
+REBUILD is no longer an eight-turn automatic phase. After a real 4+ chain, it continues until the visible
+queue exposes a plausible next trigger path, with a 14-turn safety cap. A small chain during REBUILD is
+not sufficient by itself to declare the next construction ready.
+
+Beam pruning keeps separate survival and productive-recovery reserves and restores the six-root-action
+diversity used by the stable BUILD search when no dedicated reserve is active. This prevents the new
+recovery logic from unintentionally reducing early construction diversity.
+
+The debug diagnostics now distinguish persistent game history from hypothetical search probes. The
+benchmark should continue to report maximum-chain distribution together with Game Over, recent clearing
+throughput, post-large-chain reactivation, and recovery-entry outcomes. No hidden future queue beyond the
+three visible pairs is introduced.
