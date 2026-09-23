@@ -3,6 +3,7 @@
 #include "gtr/gtr_ai.h"
 #include "search/beam_search.h"
 #include "evaluation/weights.h"
+#include "evaluation/game_history.h"
 #include "simulation/board.h"
 
 #include <string>
@@ -40,11 +41,21 @@ public:
     int weightCount() const;
     const char* weightName(int index) const;
 
+    const GameHistory& history() const { return history_; }
+
 private:
     gtr::GtrAI gtr_;
     BeamSearch search_;
     Weights weights_;
     std::string patternName_;
+    GameHistory history_;
+
+    void observeChosenMove(
+        int turn,
+        const Board& board,
+        const std::vector<PuyoPair>& pieces,
+        const Move& move
+    );
 };
 
 } // namespace puyo

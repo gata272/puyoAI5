@@ -2,6 +2,7 @@
 #include "simulation/simulator.h"
 #include "search/move_generator.h"
 #include "evaluation/debug_log.h"
+#include "evaluation/game_history.h"
 #include <sstream>
 
 #include <algorithm>
@@ -15,6 +16,7 @@ AI::AI()
 void AI::reset() {
     gtr_.reset();
     patternName_.clear();
+    history_ = GameHistory{};
 }
 
 Move AI::chooseMove(
@@ -33,6 +35,8 @@ Move AI::chooseMove(
     int beamWidth
 ) {
     if (pieces.empty()) return {-1, 0, false};
+
+    history_.synchronize(turn, board);
 
     // Preserve the current AI's first three GTR moves. Once the GTR plan is
     // unavailable or exhausted, switch to the general search/evaluation engine.
@@ -73,6 +77,7 @@ Move AI::chooseMove(
                 debugLog(oss.str());
             }
             if (!safeExists || !gtrSim.gameOver || gtrSim.allClear) {
+                observeChosenMove(turn, board, pieces, gtrMove);
                 return gtrMove;
             }
             if (debugLoggingEnabled()) {
@@ -83,13 +88,16 @@ Move AI::chooseMove(
 
     patternName_.clear();
 
-    return search_.chooseMove(
+    const Move selected = search_.chooseMove(
         board,
         pieces,
         weights_,
         std::max(1, depth),
-        std::max(1, beamWidth)
+        std::max(1, beamWidth),
+        history_
     );
+    observeChosenMove(turn, board, pieces, selected);
+    return selected;
 }
 
 void AI::resetWeights() {
@@ -114,6 +122,17 @@ const char* AI::weightName(int index) const {
 
 const char* AI::patternName() const {
     return patternName_.c_str();
+}
+
+void AI::observeChosenMove(
+    int turn,
+    const Board& board,
+    const std::vector<PuyoPair>& pieces,
+    const Move& move
+) {
+    if (!move.valid || pieces.empty()) return;
+    const SimulationResult sim = Simulator::drop(board, pieces.front(), move);
+    history_.observeMove(turn, sim.board, sim.chains, sim.erased);
 }
 
 } // namespace puyo
