@@ -13,7 +13,7 @@ int main() {
     config.progress = false;
 
     const std::string json = puyo::runChainBenchmark(config);
-    assert(json.find("\"version\":6") != std::string::npos);
+    assert(json.find("\"version\":7") != std::string::npos);
     assert(json.find("\"games\":1") != std::string::npos);
     assert(json.find("\"turns\":3") != std::string::npos);
     assert(json.find("\"gameOverReasons\":{") != std::string::npos);
