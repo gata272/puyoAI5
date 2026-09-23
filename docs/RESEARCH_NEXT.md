@@ -96,3 +96,21 @@ progress; it is danger-gated and therefore does not penalize ordinary quiet cons
 Path-level minimum-safe-move memory remains diagnostic and is not folded into utility.
 The benchmark target is to reduce low-chain/death trajectories and post-large-chain deaths
 without reducing the existing 8+/10+/12+ distribution on both fixed seeds.
+
+## PuyoAI24 lifecycle policy: BUILD -> TENSION -> RECOVER -> REBUILD
+
+PuyoAI24 introduces persistent game-level history. Search-tree hypothetical chains
+no longer determine rebuild/stagnation state. The actual game records recent chain
+activity, quiet turns, occupancy growth since the last real clear, and the age of
+the most recent 4+ chain.
+
+Policy states:
+- BUILD: normal construction; the existing main-chain / trigger machinery remains primary.
+- TENSION: the board is entering a danger zone or recent progress has weakened; retain escape candidates without globally maximizing safeMoves.
+- RECOVER: activate when accumulation and low mobility combine, or when the theoretical main-chain path diverges strongly from the visible realizable path. Recovery uses post-placement safety, net clearing, truePath, and follow-up clearing.
+- REBUILD: after an actual 4+ chain, prioritize visible follow-up trigger formation for a bounded window before returning to ordinary construction.
+
+The implementation also keeps a bounded Recovery reserve in beam pruning. This is
+separate from the existing survival reserve so that a candidate with a modest
+current score but a strong visible recovery route can survive pruning without
+turning normal construction into a mobility-maximizing policy.
