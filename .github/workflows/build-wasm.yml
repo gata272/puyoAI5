@@ -53,6 +53,7 @@ jobs:
             ai/evaluation/forms.cpp \
             ai/evaluation/debug_log.cpp \
             ai/evaluation/survival_horizon.cpp \
+            ai/evaluation/game_history.cpp \
             -I. \
             -o native_test
 
@@ -85,6 +86,7 @@ jobs:
             tests/test_virtual_chain_potential.cpp \
             ai/evaluation/virtual_chain_potential.cpp \
             ai/search/move_generator.cpp \
+            ai/simulation/board.cpp \
             ai/simulation/board.cpp \
             ai/simulation/simulator.cpp \
             -I. \
@@ -140,6 +142,7 @@ jobs:
             ai/evaluation/forms.cpp \
             ai/evaluation/debug_log.cpp \
             ai/evaluation/survival_horizon.cpp \
+            ai/evaluation/game_history.cpp \
             -I. \
             -o chain_benchmark_test
 
@@ -159,6 +162,19 @@ jobs:
             -o survival_horizon_test
 
           ./survival_horizon_test
+
+      - name: Game-history lifecycle regression test
+        run: |
+          g++ \
+            -std=c++20 \
+            -O2 \
+            tests/test_game_history.cpp \
+            ai/evaluation/game_history.cpp \
+            ai/simulation/board.cpp \
+            -I. \
+            -o game_history_test
+
+          ./game_history_test
 
       - name: Build WASM
         run: |
@@ -181,6 +197,7 @@ jobs:
             ai/evaluation/forms.cpp \
             ai/evaluation/debug_log.cpp \
             ai/evaluation/survival_horizon.cpp \
+            ai/evaluation/game_history.cpp \
             -std=c++20 \
             -O3 \
             -flto \
