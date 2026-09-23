@@ -87,7 +87,6 @@ jobs:
             ai/evaluation/virtual_chain_potential.cpp \
             ai/search/move_generator.cpp \
             ai/simulation/board.cpp \
-            ai/simulation/board.cpp \
             ai/simulation/simulator.cpp \
             -I. \
             -o virtual_chain_potential_test
