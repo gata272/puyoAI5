@@ -18,6 +18,8 @@ const char* policyModeName(PolicyMode mode);
 
 struct GameHistory {
     static constexpr int kWindow = 12;
+    static constexpr int kMeaningfulClearPuyos = 8;
+    static constexpr int kRebuildMaxAge = 14;
 
     int turn = -1;
     int lastActualChain = 0;
@@ -26,12 +28,21 @@ struct GameHistory {
     int lastBigChain = 0;
     int postBigChainAge = 99;
 
+    // `quietTurns` tracks any no-chain turns. These fields track a stricter
+    // notion of recovery progress: a small 1-chain of four puyos is not enough
+    // to declare the board meaningfully cleared.
+    int meaningfulClearAge = 99;
+    int clearedSinceMeaningfulClear = 0;
+    int occupiedAtLastMeaningfulClear = 0;
+    int occupiedGrowthSinceMeaningfulClear = 0;
+
     int quietTurns = 0;
     int occupiedAtLastChain = 0;
     int occupiedGrowthSinceChain = 0;
 
     int recentChainCount = 0;
     int recentClearPuyos = 0;
+    int recentMeaningfulClears = 0;
 
     PolicyMode mode = PolicyMode::Build;
 
@@ -43,6 +54,7 @@ struct GameHistory {
 
     std::array<int, kWindow> chainWindow{};
     std::array<int, kWindow> erasedWindow{};
+    std::array<int, kWindow> meaningfulWindow{};
     int windowSize = 0;
     int windowIndex = 0;
 
@@ -58,6 +70,11 @@ struct GameHistory {
     void observeMove(int turnNumber, const Board& board, int chains, int erased);
 
     bool inRebuild() const;
+    bool hasRecentMeaningfulClear() const { return meaningfulClearAge < 99; }
+
+    // A bounded pressure score used by policy code. It intentionally rewards
+    // actual recent clearing rather than treating every chain event as equal.
+    int clearDebtScore() const;
 };
 
 int occupiedCells(const Board& board);

@@ -37,6 +37,8 @@ struct SurvivalHorizon {
     int productiveNextMoves = 0;
     int productiveFollowupMoves = 0;
     int bestImmediateChains = 0;
+    int bestImmediateErased = 0;
+    int bestImmediatePostOccupied = BOARD_WIDTH * VISIBLE_HEIGHT;
     int bestFollowupChains = 0;
     int bestTriggerPath = 0;
 

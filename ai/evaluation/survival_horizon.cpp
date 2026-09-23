@@ -105,6 +105,10 @@ SurvivalHorizon analyzeSurvivalHorizon(
             const auto heights = sim.board.heights();
             out.trueImmediateChains = std::max(out.trueImmediateChains, sim.chains);
             out.bestImmediateChains = std::max(out.bestImmediateChains, sim.chains);
+            out.bestImmediateErased =
+                std::max(out.bestImmediateErased, std::max(0, sim.erased));
+            out.bestImmediatePostOccupied =
+                std::min(out.bestImmediatePostOccupied, occupiedCount(sim.board));
             if (sim.chains > 0) {
                 ++out.trueTriggerMoves;
                 ++out.productiveNextMoves;
