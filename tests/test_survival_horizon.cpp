@@ -48,6 +48,8 @@ int main() {
     // horizon. This is distinct from merely having a high theoretical path.
     const auto recovery = analyzeSurvivalHorizon(triggerBoard, &triggerNext, &nextNext);
     assert(recovery.bestImmediateNetClear >= 1);
+    assert(recovery.bestImmediateErased >= 1);
+    assert(recovery.bestImmediatePostOccupied >= 0);
     assert(recovery.bestImmediatePostSafeMoves > 0);
     assert(recovery.bestImmediatePostMaxHeight < VISIBLE_HEIGHT);
     assert(recovery.bestFollowupNetClear >= 1);

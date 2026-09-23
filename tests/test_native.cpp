@@ -2,6 +2,8 @@
 #include "../ai/simulation/simulator.h"
 #include "../ai/ai.h"
 #include "../ai/evaluation/trigger_route.h"
+#include "../ai/evaluation/debug_log.h"
+#include "../ai/evaluation/game_history.h"
 #include <cassert>
 #include <iostream>
 
@@ -62,6 +64,47 @@ int main() {
     horizontal.set(0,2,puyo::Cell::Blue);
     horizontal.set(0,3,puyo::Cell::Red);
     assert(puyo::triggerRouteLength(horizontal) >= 2);
+
+    // Debug-mode determinism regression: enabling debug tracing may add work,
+    // but it must not alter the selected moves or the resulting board state.
+    {
+        std::vector<puyo::PuyoPair> queue = {
+            {1, 2}, {3, 4}, {2, 1}, {4, 3}, {1, 1},
+            {2, 4}, {3, 2}, {4, 4}, {1, 3}, {2, 2}
+        };
+        puyo::Board normalBoard;
+        puyo::Board debugBoard = normalBoard;
+        puyo::AI normalAI;
+        puyo::AI debugAI;
+
+        puyo::setDebugConsoleLogging(false);
+        puyo::setDebugLogging(false);
+        for (int turn = 0; turn < 8; ++turn) {
+            std::vector<puyo::PuyoPair> visible(queue.begin() + turn,
+                                                 queue.begin() + turn + 3);
+            const auto normalMove = normalAI.chooseMove(
+                turn, normalBoard, visible, 3, 8);
+            puyo::setDebugLogging(true);
+            const auto debugMove = debugAI.chooseMove(
+                turn, debugBoard, visible, 3, 8);
+            puyo::setDebugLogging(false);
+
+            assert(normalMove.valid == debugMove.valid);
+            assert(normalMove.x == debugMove.x);
+            assert(normalMove.rotation == debugMove.rotation);
+
+            const auto normalSim = puyo::Simulator::drop(
+                normalBoard, visible.front(), normalMove);
+            const auto debugSim = puyo::Simulator::drop(
+                debugBoard, visible.front(), debugMove);
+            assert(puyo::boardStateHash(normalSim.board) ==
+                   puyo::boardStateHash(debugSim.board));
+            normalBoard = normalSim.board;
+            debugBoard = debugSim.board;
+        }
+        puyo::setDebugLogging(false);
+        puyo::setDebugConsoleLogging(true);
+    }
 
     std::cout << "native AI smoke test passed: "
               << next.x << "," << next.rotation << "\n";
