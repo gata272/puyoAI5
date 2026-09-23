@@ -15,6 +15,7 @@ AI_SOURCES := \
 	ai/evaluation/forms.cpp \
 	ai/evaluation/debug_log.cpp \
 	ai/evaluation/survival_horizon.cpp \
+	ai/evaluation/game_history.cpp \
 	ai/search/move_generator.cpp \
 	ai/search/beam_search.cpp \
 	ai/gtr/gtr_ai.cpp \
@@ -37,6 +38,10 @@ test:
 		tests/test_virtual_chain_potential.cpp $(AI_SOURCES) \
 		-o /tmp/puyoai_virtual_test
 	/tmp/puyoai_virtual_test
+	$(CXX) $(CXXFLAGS) $(INCLUDES) \
+		tests/test_game_history.cpp ai/evaluation/game_history.cpp ai/simulation/board.cpp \
+		-o /tmp/puyoai_game_history_test
+	/tmp/puyoai_game_history_test
 
 benchmark-test:
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pedantic $(INCLUDES) \
