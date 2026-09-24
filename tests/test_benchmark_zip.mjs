@@ -22,5 +22,6 @@ assert.deepEqual(progress.at(-1), [3, 3]);
 const bytes = new Uint8Array(await blob.arrayBuffer());
 assert.equal(String.fromCharCode(...bytes.slice(0, 4)), 'PK\x03\x04');
 assert.equal(String.fromCharCode(...bytes.slice(-22, -18)), 'PK\x05\x06');
+assert.ok(bytes.length > 22);
 
 console.log(`benchmark ZIP writer test passed (${bytes.length} bytes)`);
