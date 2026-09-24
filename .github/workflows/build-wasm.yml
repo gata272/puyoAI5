@@ -31,6 +31,12 @@ jobs:
       - name: Check Emscripten
         run: emcc --version
 
+      - name: Benchmark ZIP JavaScript regression test
+        run: |
+          node --version
+          node tests/test_benchmark_zip.mjs
+          node tests/test_benchmark_export_path.mjs
+
       - name: Native smoke test
         run: |
           g++ \
