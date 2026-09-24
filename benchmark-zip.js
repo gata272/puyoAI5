@@ -141,6 +141,10 @@ export async function createBenchmarkZip(result, readGame, onProgress = () => {}
             dosTime,
             dosDate
         );
+        const nextOffset = offset + local.length + compressed.bytes.length;
+        if (nextOffset > 0xFFFFFFFF) {
+            throw new Error('ZIP形式の4GiB制限を超えています。試行数を分割してください');
+        }
         parts.push(local, compressed.bytes);
         central.push(makeZipCentralHeader(
             nameBytes,
@@ -152,7 +156,7 @@ export async function createBenchmarkZip(result, readGame, onProgress = () => {}
             dosDate,
             offset
         ));
-        offset += local.length + compressed.bytes.length;
+        offset = nextOffset;
     };
 
     await append('summary.json', `${JSON.stringify(result, null, 2)}\n`);

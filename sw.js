@@ -1,4 +1,4 @@
-const CACHE_NAME = 'puyo-sim-v10-inline-benchmark-export';
+const CACHE_NAME = 'puyo-sim-v11-inline-benchmark-export-worker';
 
 const urlsToCache = [
     './',
