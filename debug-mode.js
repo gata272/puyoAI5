@@ -308,196 +308,31 @@
         }
     }
 
-    function crc32(bytes) {
-        if (!crc32.table) {
-            const table = new Uint32Array(256);
-            for (let n = 0; n < 256; n += 1) {
-                let c = n;
-                for (let k = 0; k < 8; k += 1) {
-                    c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-                }
-                table[n] = c >>> 0;
-            }
-            crc32.table = table;
-        }
-        let c = 0xFFFFFFFF;
-        for (let i = 0; i < bytes.length; i += 1) {
-            c = crc32.table[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
-        }
-        return (c ^ 0xFFFFFFFF) >>> 0;
-    }
-
-    function dosDateTime(date = new Date()) {
-        const year = Math.max(1980, date.getFullYear());
-        const dosTime =
-            (date.getHours() << 11) |
-            (date.getMinutes() << 5) |
-            Math.floor(date.getSeconds() / 2);
-        const dosDate =
-            ((year - 1980) << 9) |
-            ((date.getMonth() + 1) << 5) |
-            date.getDate();
-        return { dosTime, dosDate };
-    }
-
-    function makeZipLocalHeader(nameBytes, method, crc, compressedSize, size, dosTime, dosDate) {
-        const header = new Uint8Array(30 + nameBytes.length);
-        const view = new DataView(header.buffer);
-        view.setUint32(0, 0x04034B50, true);
-        view.setUint16(4, 20, true);
-        view.setUint16(6, 0x0800, true); // UTF-8 file names, known sizes.
-        view.setUint16(8, method, true);
-        view.setUint16(10, dosTime, true);
-        view.setUint16(12, dosDate, true);
-        view.setUint32(14, crc >>> 0, true);
-        view.setUint32(18, compressedSize >>> 0, true);
-        view.setUint32(22, size >>> 0, true);
-        view.setUint16(26, nameBytes.length, true);
-        view.setUint16(28, 0, true);
-        header.set(nameBytes, 30);
-        return header;
-    }
-
-    function makeZipCentralHeader(nameBytes, method, crc, compressedSize, size, dosTime, dosDate, localOffset) {
-        const header = new Uint8Array(46 + nameBytes.length);
-        const view = new DataView(header.buffer);
-        view.setUint32(0, 0x02014B50, true);
-        view.setUint16(4, 20, true);
-        view.setUint16(6, 20, true);
-        view.setUint16(8, 0x0800, true);
-        view.setUint16(10, method, true);
-        view.setUint16(12, dosTime, true);
-        view.setUint16(14, dosDate, true);
-        view.setUint32(16, crc >>> 0, true);
-        view.setUint32(20, compressedSize >>> 0, true);
-        view.setUint32(24, size >>> 0, true);
-        view.setUint16(28, nameBytes.length, true);
-        view.setUint16(30, 0, true);
-        view.setUint16(32, 0, true);
-        view.setUint16(34, 0, true);
-        view.setUint16(36, 0, true);
-        view.setUint32(38, 0, true);
-        view.setUint32(42, localOffset >>> 0, true);
-        header.set(nameBytes, 46);
-        return header;
-    }
-
-    function makeZipEnd(entries, centralDirectorySize, centralDirectoryOffset) {
-        const end = new Uint8Array(22);
-        const view = new DataView(end.buffer);
-        view.setUint32(0, 0x06054B50, true);
-        view.setUint16(4, 0, true);
-        view.setUint16(6, 0, true);
-        view.setUint16(8, entries, true);
-        view.setUint16(10, entries, true);
-        view.setUint32(12, centralDirectorySize >>> 0, true);
-        view.setUint32(16, centralDirectoryOffset >>> 0, true);
-        view.setUint16(20, 0, true);
-        return end;
-    }
-
-    async function compressZipPayload(bytes) {
-        if (typeof global.CompressionStream !== 'function') {
-            return { method: 0, bytes };
-        }
+    function openBenchmarkExport(runId) {
+        if (!runId) return false;
+        const target = `./benchmark-export.html?runId=${encodeURIComponent(runId)}`;
+        // Open the export page synchronously while the click gesture is still
+        // active. iOS Safari may reject a download that is initiated only after
+        // an asynchronous IndexedDB/CompressionStream operation. The export
+        // page performs those asynchronous operations itself and exposes a
+        // normal user-tappable save link as a fallback.
+        let popup = null;
         try {
-            // The standardized "deflate" CompressionStream uses a zlib wrapper.
-            // ZIP's method 8 expects the raw DEFLATE payload, so remove the
-            // 2-byte zlib header and 4-byte Adler-32 trailer.
-            const stream = new global.CompressionStream('deflate');
-            const writer = stream.writable.getWriter();
-            await writer.write(bytes);
-            await writer.close();
-            const wrapped = new Uint8Array(await new Response(stream.readable).arrayBuffer());
-            if (wrapped.length < 6) return { method: 0, bytes };
-            const raw = wrapped.subarray(2, wrapped.length - 4);
-            if (raw.length >= bytes.length) return { method: 0, bytes };
-            return { method: 8, bytes: raw };
-        } catch (error) {
-            console.warn('[Benchmark ZIP] DEFLATE failed; using STORE entries', error);
-            return { method: 0, bytes };
+            popup = global.open(target, '_blank');
+        } catch (_) {
+            popup = null;
         }
-    }
+        if (popup) return true;
 
-    async function buildBenchmarkZipBlob(runId, result) {
-        const encoder = new TextEncoder();
-        const parts = [];
-        const central = [];
-        const timestamp = new Date();
-        const { dosTime, dosDate } = dosDateTime(timestamp);
-        let offset = 0;
-
-        const appendEntry = async (name, sourceText) => {
-            const bytes = typeof sourceText === 'string' ? encoder.encode(sourceText) : sourceText;
-            const crc = crc32(bytes);
-            const compressed = await compressZipPayload(bytes);
-            if (bytes.length > 0xFFFFFFFF || compressed.bytes.length > 0xFFFFFFFF || offset > 0xFFFFFFFF) {
-                throw new Error('ZIP形式の4GiB制限を超えるログです。試行数を分割して保存してください。');
-            }
-            const nameBytes = encoder.encode(name);
-            if (nameBytes.length > 0xFFFF) throw new Error(`ファイル名が長すぎます: ${name}`);
-            const local = makeZipLocalHeader(
-                nameBytes,
-                compressed.method,
-                crc,
-                compressed.bytes.length,
-                bytes.length,
-                dosTime,
-                dosDate
-            );
-            parts.push(local, compressed.bytes);
-            central.push(makeZipCentralHeader(
-                nameBytes,
-                compressed.method,
-                crc,
-                compressed.bytes.length,
-                bytes.length,
-                dosTime,
-                dosDate,
-                offset
-            ));
-            offset += local.length + compressed.bytes.length;
-        };
-
-        const readGame = async (gameIndex) => {
-            const db = await openBenchmarkDB();
-            return new Promise((resolve, reject) => {
-                const tx = db.transaction('games', 'readonly');
-                const request = tx.objectStore('games').get(`${runId}:${gameIndex}`);
-                request.onsuccess = () => resolve(request.result || null);
-                request.onerror = () => reject(request.error || new Error(`ゲーム${gameIndex + 1}のログを読めませんでした`));
-            });
-        };
-
-        await appendEntry('summary.json', `${JSON.stringify(result, null, 2)}\n`);
-        await appendEntry('README.txt', [
-            'PuyoAI benchmark log archive',
-            '',
-            'summary.json: benchmark-wide summary.',
-            'game_XXXX.json: one game, including per-turn decision logs when detailed logging was enabled.',
-            'Logs are stored independently so the benchmark completion step does not create one giant JSON object in memory.',
-            ''
-        ].join('\n'));
-
-        for (let game = 0; game < Number(result.games); game += 1) {
-            const record = await readGame(game);
-            if (!record || typeof record.json !== 'string') {
-                throw new Error(`ゲーム${game + 1}のログがIndexedDBに見つかりません`);
-            }
-            const suffix = String(game + 1).padStart(4, '0');
-            await appendEntry(`game_${suffix}.json`, record.json);
-            if ((game + 1) % 10 === 0 || game + 1 === Number(result.games)) {
-                setStatus(`ZIP作成中… ${game + 1} / ${result.games} ゲーム`);
-            }
+        // Popup blocking should never leave the user with no response.
+        // Navigating the current tab is the reliable fallback on mobile Safari.
+        try {
+            global.location.assign(target);
+            return true;
+        } catch (_) {
+            setStatus('ZIP保存画面を開けませんでした');
+            return false;
         }
-
-        const centralOffset = offset;
-        const centralBytes = central.reduce((sum, item) => sum + item.length, 0);
-        if (centralOffset > 0xFFFFFFFF || centralBytes > 0xFFFFFFFF || central.length > 0xFFFF) {
-            throw new Error('ZIP形式のサイズ上限を超えました。試行数を分割して保存してください。');
-        }
-        parts.push(...central, makeZipEnd(central.length, centralBytes, centralOffset));
-        return new Blob(parts, { type: 'application/zip' });
     }
 
     function initWorker() {
@@ -769,27 +604,15 @@
         }
     };
 
-    global.downloadBenchmarkLog = async function () {
+    global.downloadBenchmarkLog = function () {
         const result = STATE.benchmarkResult;
         const runId = STATE.benchmarkRunId;
-        if (!result || !runId) return;
-        try {
-            setStatus('ZIPを作成しています…');
-            const blob = await buildBenchmarkZipBlob(runId, result);
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-            link.href = url;
-            link.download = `puyoAI-benchmark-${stamp}.zip`;
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 5000);
-            setStatus('測定ログをZIP形式で保存しました');
-        } catch (error) {
-            console.error('[Benchmark ZIP]', error);
-            setStatus(`ZIP保存に失敗しました: ${error?.message || error}`);
+        if (!result || !runId) {
+            setStatus('保存できるベンチマーク結果がありません');
+            return;
         }
+        setStatus('ZIP保存画面を開いています…');
+        openBenchmarkExport(runId);
     };
 
     global.initializeDebugMode = function () {

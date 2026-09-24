@@ -1,4 +1,4 @@
-const CACHE_NAME = 'puyo-sim-v8-incremental-benchmark-logs';
+const CACHE_NAME = 'puyo-sim-v9-benchmark-export-fix';
 
 const urlsToCache = [
     './',
@@ -13,6 +13,9 @@ const urlsToCache = [
     './puyoAI_wasm.mjs',
     './puyoAI_wasm.wasm',
     './benchmark-worker.js',
+    './benchmark-export.html',
+    './benchmark-export.js',
+    './benchmark-zip.js',
     './manifest.json',
     './apple-touch-icon.png',
     './android-icon-192x192.png',
