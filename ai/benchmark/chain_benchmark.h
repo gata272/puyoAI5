@@ -20,6 +20,13 @@ struct ChainBenchmarkConfig {
 
 // Runs a deterministic, single-player benchmark. Every configuration using
 // the same seed/games/turns receives exactly the same generated piece corpus.
+// Runs exactly one deterministic game and returns a self-contained JSON record.
+// The browser uses this entry point to avoid constructing one giant JSON object
+// for the entire benchmark run.
+std::string runChainBenchmarkGame(const ChainBenchmarkConfig& config, int gameIndex);
+
+// Runs the complete benchmark in one call. Kept for CLI/native tooling and
+// compatibility; the browser uses runChainBenchmarkGame() incrementally.
 // The returned string is a JSON object suitable for the browser UI.
 std::string runChainBenchmark(const ChainBenchmarkConfig& config);
 

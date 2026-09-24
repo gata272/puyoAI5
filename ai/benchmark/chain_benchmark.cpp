@@ -250,6 +250,253 @@ std::string jsonBool(bool value) {
 
 } // namespace
 
+struct GameRunResult {
+    GameStats stats;
+    std::vector<SafetySnapshot> diagnostics;
+    std::vector<DecisionLogEntry> decisionLogs;
+    long long totalThinkMicros = 0;
+    int totalMoves = 0;
+    double wallMs = 0.0;
+};
+
+GameRunResult runSingleGame(
+    const ChainBenchmarkConfig& config,
+    int gameIndex,
+    bool collectDiagnostics
+) {
+    GameRunResult result;
+    const auto gameStart = std::chrono::steady_clock::now();
+
+    AI ai;
+    ai.reset();
+    Board board;
+    const auto queue = makeQueue(config.seed, gameIndex, config.turns);
+
+    std::vector<TurnSnapshot> recentTurns;
+    recentTurns.reserve(kDiagnosticsHistory);
+    if (config.recordDecisionLog) {
+        result.decisionLogs.reserve(static_cast<std::size_t>(config.turns));
+    }
+
+    for (int turn = 0; turn < config.turns; ++turn) {
+        // AI needs the current pair plus two lookahead pairs.
+        std::vector<PuyoPair> pieces;
+        pieces.reserve(3);
+        for (int i = 0; i < 3 && turn + i < static_cast<int>(queue.size()); ++i) {
+            pieces.push_back(queue[turn + i]);
+        }
+        if (pieces.empty()) break;
+
+        recentTurns.push_back({turn, board, pieces[0]});
+        if (recentTurns.size() > static_cast<std::size_t>(kDiagnosticsHistory)) {
+            recentTurns.erase(recentTurns.begin());
+        }
+
+        const auto thinkStart = std::chrono::steady_clock::now();
+        const Move move = ai.chooseMove(
+            turn,
+            board,
+            pieces,
+            config.depth,
+            config.beamWidth
+        );
+        const auto thinkEnd = std::chrono::steady_clock::now();
+        const long long thinkMicros = std::chrono::duration_cast<std::chrono::microseconds>(
+            thinkEnd - thinkStart
+        ).count();
+        result.totalThinkMicros += thinkMicros;
+        ++result.totalMoves;
+
+        DecisionLogEntry logEntry;
+        if (config.recordDecisionLog) {
+            logEntry.turn = turn;
+            logEntry.preBoard = board;
+            logEntry.current = pieces[0];
+            if (pieces.size() > 1) { logEntry.next1 = pieces[1]; logEntry.hasNext1 = true; }
+            if (pieces.size() > 2) { logEntry.next2 = pieces[2]; logEntry.hasNext2 = true; }
+            logEntry.selected = move;
+            logEntry.thinkMicros = thinkMicros;
+            logEntry.debugLog = takeDebugLog();
+        } else {
+            // Keep the global debug logger clean even when detailed logs are off.
+            takeDebugLog();
+        }
+
+        if (!move.valid) {
+            result.stats.gameOver = true;
+            result.stats.gameOverReason = GameOverReason::InvalidMove;
+            if (config.recordDecisionLog) {
+                logEntry.geometricMoves = 0;
+                logEntry.safeMoves = 0;
+                logEntry.selectedSafe = false;
+                logEntry.simulation = SimulationResult{};
+                result.decisionLogs.push_back(std::move(logEntry));
+            }
+            break;
+        }
+
+        const auto geometricMoves = generateLegalMoves(board, pieces[0]);
+        if (geometricMoves.empty()) {
+            result.stats.gameOver = true;
+            result.stats.gameOverReason = GameOverReason::NoGeometricMove;
+            if (config.recordDecisionLog) {
+                logEntry.geometricMoves = 0;
+                logEntry.safeMoves = 0;
+                logEntry.selectedSafe = false;
+                logEntry.simulation = SimulationResult{};
+                result.decisionLogs.push_back(std::move(logEntry));
+            }
+            break;
+        }
+
+        const SimulationResult sim = Simulator::drop(board, pieces[0], move);
+        int safeMoves = 0;
+        if (config.recordDecisionLog || (sim.gameOver && !sim.allClear)) {
+            for (const auto& candidateMove : geometricMoves) {
+                const SimulationResult candidateSim =
+                    Simulator::drop(board, pieces[0], candidateMove);
+                if (!candidateSim.gameOver || candidateSim.allClear) ++safeMoves;
+            }
+        }
+
+        if (config.recordDecisionLog) {
+            logEntry.geometricMoves = static_cast<int>(geometricMoves.size());
+            logEntry.safeMoves = safeMoves;
+            logEntry.selectedSafe = !sim.gameOver || sim.allClear;
+            logEntry.simulation = sim;
+            result.decisionLogs.push_back(std::move(logEntry));
+        }
+
+        if (sim.gameOver && !sim.allClear) {
+            result.stats.safeMovesAtEnd = safeMoves;
+            result.stats.geometricMovesAtEnd = static_cast<int>(geometricMoves.size());
+            result.stats.gameOverReason = safeMoves == 0
+                ? GameOverReason::NoSafeMove
+                : GameOverReason::SelectedDeathWithSafeMove;
+            result.stats.gameOver = true;
+            board = sim.board;
+            break;
+        }
+
+        board = sim.board;
+        result.stats.maxChain = std::max(result.stats.maxChain, sim.chains);
+        result.stats.score += sim.score;
+        ++result.stats.turns;
+    }
+
+    const auto endHeights = board.heights();
+    result.stats.maxHeightAtEnd = *std::max_element(endHeights.begin(), endHeights.end());
+    result.stats.dangerColumnHeightAtEnd = endHeights[2];
+    result.stats.occupiedAtEnd = std::accumulate(endHeights.begin(), endHeights.end(), 0);
+
+    if (collectDiagnostics && result.stats.gameOver) {
+        result.diagnostics = diagnoseRecentTurns(recentTurns, result.stats.turns);
+    }
+
+    const auto gameEnd = std::chrono::steady_clock::now();
+    result.wallMs = std::chrono::duration<double, std::milli>(gameEnd - gameStart).count();
+    return result;
+}
+
+void appendDecisionTurnJson(std::ostringstream& json, const DecisionLogEntry& d) {
+    json << "{\"turn\":" << d.turn
+         << ",\"preBoard\":\"" << boardCompact(d.preBoard) << "\""
+         << ",\"current\":";
+    appendPairJson(json, d.current);
+    json << ",\"next1\":";
+    if (d.hasNext1) appendPairJson(json, d.next1); else json << "null";
+    json << ",\"next2\":";
+    if (d.hasNext2) appendPairJson(json, d.next2); else json << "null";
+    json << ",\"move\":{\"x\":" << d.selected.x
+         << ",\"rotation\":" << d.selected.rotation
+         << ",\"valid\":" << jsonBool(d.selected.valid) << "}"
+         << ",\"geometricMoves\":" << d.geometricMoves
+         << ",\"safeMoves\":" << d.safeMoves
+         << ",\"selectedSafe\":" << jsonBool(d.selectedSafe)
+         << ",\"thinkMicros\":" << d.thinkMicros
+         << ",\"postBoard\":\"" << boardCompact(d.simulation.board) << "\""
+         << ",\"chains\":" << d.simulation.chains
+         << ",\"score\":" << d.simulation.score
+         << ",\"gameOver\":" << jsonBool(d.simulation.gameOver)
+         << ",\"allClear\":" << jsonBool(d.simulation.allClear)
+         << ",\"debugLog\":\"" << jsonEscape(d.debugLog) << "\"}";
+}
+
+std::string serializeGameResult(
+    const ChainBenchmarkConfig& config,
+    int gameIndex,
+    const GameRunResult& result
+) {
+    std::ostringstream json;
+    json << "{";
+    json << "\"version\":1,";
+    json << "\"benchmarkVersion\":8,";
+    json << "\"game\":" << gameIndex << ",";
+    json << "\"games\":" << config.games << ",";
+    json << "\"turns\":" << config.turns << ",";
+    json << "\"seed\":" << config.seed << ",";
+    json << "\"depth\":" << config.depth << ",";
+    json << "\"beamWidth\":" << config.beamWidth << ",";
+    json << "\"recordDecisionLog\":" << jsonBool(config.recordDecisionLog) << ",";
+    json << "\"maxChain\":" << result.stats.maxChain << ",";
+    json << "\"score\":" << result.stats.score << ",";
+    json << "\"turnsSurvived\":" << result.stats.turns << ",";
+    json << "\"loggedTurns\":" << result.decisionLogs.size() << ",";
+    json << "\"gameOver\":" << jsonBool(result.stats.gameOver) << ",";
+    json << "\"gameOverReason\":\"" << gameOverReasonName(result.stats.gameOverReason) << "\",";
+    json << "\"maxHeightAtEnd\":" << result.stats.maxHeightAtEnd << ",";
+    json << "\"dangerColumnHeightAtEnd\":" << result.stats.dangerColumnHeightAtEnd << ",";
+    json << "\"occupiedAtEnd\":" << result.stats.occupiedAtEnd << ",";
+    json << "\"geometricMovesAtEnd\":" << result.stats.geometricMovesAtEnd << ",";
+    json << "\"safeMovesAtEnd\":" << result.stats.safeMovesAtEnd << ",";
+    json << "\"totalThinkMicros\":" << result.totalThinkMicros << ",";
+    json << "\"totalMoves\":" << result.totalMoves << ",";
+    json << "\"wallMs\":" << jsonNumber(result.wallMs) << ",";
+
+    json << "\"diagnostics\":[";
+    for (std::size_t i = 0; i < result.diagnostics.size(); ++i) {
+        if (i > 0) json << ",";
+        const auto& d = result.diagnostics[i];
+        json << "{\"turnsBeforeDeath\":" << d.turnsBeforeDeath
+             << ",\"turn\":" << d.turn
+             << ",\"geometricMoves\":" << d.geometricMoves
+             << ",\"safeMoves\":" << d.safeMoves
+             << ",\"maxHeight\":" << d.maxHeight
+             << ",\"dangerColumnHeight\":" << d.dangerColumnHeight
+             << ",\"occupied\":" << d.occupied << "}";
+    }
+    json << "],";
+
+    json << "\"turnLogs\":[";
+    if (config.recordDecisionLog) {
+        for (std::size_t i = 0; i < result.decisionLogs.size(); ++i) {
+            if (i > 0) json << ",";
+            appendDecisionTurnJson(json, result.decisionLogs[i]);
+        }
+    }
+    json << "]";
+    json << "}";
+    return json.str();
+}
+
+std::string runChainBenchmarkGame(const ChainBenchmarkConfig& rawConfig, int gameIndex) {
+    ChainBenchmarkConfig config = rawConfig;
+    config.games = clampInt(config.games, kMinGames, kMaxGames);
+    config.turns = clampInt(config.turns, kMinTurns, kMaxTurns);
+    config.depth = clampInt(config.depth, kMinDepth, kMaxDepth);
+    config.beamWidth = clampInt(config.beamWidth, kMinBeam, kMaxBeam);
+    if (gameIndex < 0 || gameIndex >= config.games) {
+        return "";
+    }
+
+    setDebugLogging(config.recordDecisionLog);
+    setDebugConsoleLogging(false);
+    const GameRunResult result = runSingleGame(config, gameIndex, true);
+    setDebugLogging(false);
+    setDebugConsoleLogging(true);
+    return serializeGameResult(config, gameIndex, result);
+}
+
 std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
     ChainBenchmarkConfig config = rawConfig;
     config.games = clampInt(config.games, kMinGames, kMaxGames);
@@ -278,128 +525,12 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
     const auto benchmarkStart = std::chrono::steady_clock::now();
 
     for (int game = 0; game < config.games; ++game) {
-        AI ai;
-        ai.reset();
-        Board board;
-        const auto queue = makeQueue(config.seed, game, config.turns);
+        const GameRunResult result = runSingleGame(config, game, config.progress);
+        const GameStats& stats = result.stats;
 
-        GameStats stats;
-        std::vector<TurnSnapshot> recentTurns;
-        recentTurns.reserve(kDiagnosticsHistory);
         if (config.recordDecisionLog) {
-            decisionLogs[static_cast<std::size_t>(game)].reserve(static_cast<std::size_t>(config.turns));
+            decisionLogs[static_cast<std::size_t>(game)] = result.decisionLogs;
         }
-
-        for (int turn = 0; turn < config.turns; ++turn) {
-            // AI needs the current pair plus two lookahead pairs.
-            std::vector<PuyoPair> pieces;
-            pieces.reserve(3);
-            for (int i = 0; i < 3 && turn + i < static_cast<int>(queue.size()); ++i) {
-                pieces.push_back(queue[turn + i]);
-            }
-            if (pieces.empty()) break;
-
-            recentTurns.push_back({turn, board, pieces[0]});
-            if (recentTurns.size() > static_cast<std::size_t>(kDiagnosticsHistory)) {
-                recentTurns.erase(recentTurns.begin());
-            }
-
-            const auto thinkStart = std::chrono::steady_clock::now();
-            const Move move = ai.chooseMove(
-                turn,
-                board,
-                pieces,
-                config.depth,
-                config.beamWidth
-            );
-            const auto thinkEnd = std::chrono::steady_clock::now();
-            const long long thinkMicros = std::chrono::duration_cast<std::chrono::microseconds>(
-                thinkEnd - thinkStart
-            ).count();
-            totalThinkMicros += thinkMicros;
-            ++totalMoves;
-
-            DecisionLogEntry logEntry;
-            if (config.recordDecisionLog) {
-                logEntry.turn = turn;
-                logEntry.preBoard = board;
-                logEntry.current = pieces[0];
-                if (pieces.size() > 1) { logEntry.next1 = pieces[1]; logEntry.hasNext1 = true; }
-                if (pieces.size() > 2) { logEntry.next2 = pieces[2]; logEntry.hasNext2 = true; }
-                logEntry.selected = move;
-                logEntry.thinkMicros = thinkMicros;
-                logEntry.debugLog = takeDebugLog();
-            } else {
-                // Keep the global debug logger clean even when detailed logs are off.
-                takeDebugLog();
-            }
-
-            if (!move.valid) {
-                stats.gameOver = true;
-                stats.gameOverReason = GameOverReason::InvalidMove;
-                if (config.recordDecisionLog) {
-                    logEntry.geometricMoves = 0;
-                    logEntry.safeMoves = 0;
-                    logEntry.selectedSafe = false;
-                    logEntry.simulation = SimulationResult{};
-                    decisionLogs[static_cast<std::size_t>(game)].push_back(std::move(logEntry));
-                }
-                break;
-            }
-
-            const auto geometricMoves = generateLegalMoves(board, pieces[0]);
-            if (geometricMoves.empty()) {
-                stats.gameOver = true;
-                stats.gameOverReason = GameOverReason::NoGeometricMove;
-                if (config.recordDecisionLog) {
-                    logEntry.geometricMoves = 0;
-                    logEntry.safeMoves = 0;
-                    logEntry.selectedSafe = false;
-                    logEntry.simulation = SimulationResult{};
-                    decisionLogs[static_cast<std::size_t>(game)].push_back(std::move(logEntry));
-                }
-                break;
-            }
-
-            const SimulationResult sim = Simulator::drop(board, pieces[0], move);
-            int safeMoves = 0;
-            if (config.recordDecisionLog || (sim.gameOver && !sim.allClear)) {
-                for (const auto& candidateMove : geometricMoves) {
-                    const SimulationResult candidateSim =
-                        Simulator::drop(board, pieces[0], candidateMove);
-                    if (!candidateSim.gameOver || candidateSim.allClear) ++safeMoves;
-                }
-            }
-
-            if (config.recordDecisionLog) {
-                logEntry.geometricMoves = static_cast<int>(geometricMoves.size());
-                logEntry.safeMoves = safeMoves;
-                logEntry.selectedSafe = !sim.gameOver || sim.allClear;
-                logEntry.simulation = sim;
-                decisionLogs[static_cast<std::size_t>(game)].push_back(std::move(logEntry));
-            }
-
-            if (sim.gameOver && !sim.allClear) {
-                stats.safeMovesAtEnd = safeMoves;
-                stats.geometricMovesAtEnd = static_cast<int>(geometricMoves.size());
-                stats.gameOverReason = safeMoves == 0
-                    ? GameOverReason::NoSafeMove
-                    : GameOverReason::SelectedDeathWithSafeMove;
-                stats.gameOver = true;
-                board = sim.board;
-                break;
-            }
-
-            board = sim.board;
-            stats.maxChain = std::max(stats.maxChain, sim.chains);
-            stats.score += sim.score;
-            ++stats.turns;
-        }
-
-        const auto endHeights = board.heights();
-        stats.maxHeightAtEnd = *std::max_element(endHeights.begin(), endHeights.end());
-        stats.dangerColumnHeightAtEnd = endHeights[2];
-        stats.occupiedAtEnd = std::accumulate(endHeights.begin(), endHeights.end(), 0);
 
         if (stats.gameOver) {
             ++gamesOver;
@@ -410,12 +541,13 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
         }
         totalScore += stats.score;
         totalTurns += stats.turns;
+        totalThinkMicros += result.totalThinkMicros;
+        totalMoves += result.totalMoves;
         globalMaxChain = std::max(globalMaxChain, stats.maxChain);
         maxChains.push_back(stats.maxChain);
 
         if (config.progress && stats.gameOver) {
-            const auto diagnostics = diagnoseRecentTurns(recentTurns, stats.turns);
-            for (const auto& d : diagnostics) {
+            for (const auto& d : result.diagnostics) {
                 if (d.turnsBeforeDeath >= 0 && d.turnsBeforeDeath < kDiagnosticsHistory) {
                     const auto index = static_cast<std::size_t>(d.turnsBeforeDeath);
                     diagnosticSafeMoveSum[index] += d.safeMoves;
@@ -481,8 +613,7 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
 
     auto countAtLeast = [&](int threshold) {
         return static_cast<int>(std::count_if(
-            maxChains.begin(),
-            maxChains.end(),
+            maxChains.begin(), maxChains.end(),
             [threshold](int value) { return value >= threshold; }
         ));
     };
@@ -584,28 +715,7 @@ std::string runChainBenchmark(const ChainBenchmarkConfig& rawConfig) {
             const auto& logs = decisionLogs[game];
             for (std::size_t i = 0; i < logs.size(); ++i) {
                 if (i > 0) json << ",";
-                const auto& d = logs[i];
-                json << "{\"turn\":" << d.turn
-                     << ",\"preBoard\":\"" << boardCompact(d.preBoard) << "\""
-                     << ",\"current\":";
-                appendPairJson(json, d.current);
-                json << ",\"next1\":";
-                if (d.hasNext1) appendPairJson(json, d.next1); else json << "null";
-                json << ",\"next2\":";
-                if (d.hasNext2) appendPairJson(json, d.next2); else json << "null";
-                json << ",\"move\":{\"x\":" << d.selected.x
-                     << ",\"rotation\":" << d.selected.rotation
-                     << ",\"valid\":" << jsonBool(d.selected.valid) << "}"
-                     << ",\"geometricMoves\":" << d.geometricMoves
-                     << ",\"safeMoves\":" << d.safeMoves
-                     << ",\"selectedSafe\":" << jsonBool(d.selectedSafe)
-                     << ",\"thinkMicros\":" << d.thinkMicros
-                     << ",\"postBoard\":\"" << boardCompact(d.simulation.board) << "\""
-                     << ",\"chains\":" << d.simulation.chains
-                     << ",\"score\":" << d.simulation.score
-                     << ",\"gameOver\":" << jsonBool(d.simulation.gameOver)
-                     << ",\"allClear\":" << jsonBool(d.simulation.allClear)
-                     << ",\"debugLog\":\"" << jsonEscape(d.debugLog) << "\"}";
+                appendDecisionTurnJson(json, logs[i]);
             }
             json << "]}";
         }
