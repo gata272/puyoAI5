@@ -82,6 +82,28 @@ int ai_choose_move(
 }
 
 EMSCRIPTEN_KEEPALIVE
+const char* run_chain_benchmark_game(
+    int games,
+    int turns,
+    int seed,
+    int depth,
+    int beamWidth,
+    int recordDecisionLog,
+    int gameIndex
+) {
+    puyo::ChainBenchmarkConfig config;
+    config.games = games;
+    config.turns = turns;
+    config.seed = seed;
+    config.depth = depth;
+    config.beamWidth = beamWidth;
+    config.progress = false;
+    config.recordDecisionLog = recordDecisionLog != 0;
+    g_benchmarkResult = puyo::runChainBenchmarkGame(config, gameIndex);
+    return g_benchmarkResult.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE
 const char* run_chain_benchmark(
     int games,
     int turns,
