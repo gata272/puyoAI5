@@ -276,6 +276,14 @@ jobs:
           cp puyoAI_wasm.mjs _site/puyoAI_wasm.mjs
           cp puyoAI_wasm.wasm _site/puyoAI_wasm.wasm
 
+          test -f _site/benchmark-zip.js
+          test -f _site/debug-mode.js
+          if grep -R --line-number --fixed-strings 'benchmark-export.html' _site >/tmp/benchmark_export_refs.txt; then
+            echo 'ERROR: stale benchmark-export.html reference remains in Pages artifact:'
+            cat /tmp/benchmark_export_refs.txt
+            exit 1
+          fi
+
           echo "=== Pages artifact ==="
           find _site -maxdepth 3 -type f | sort
 
