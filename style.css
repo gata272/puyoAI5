@@ -615,3 +615,42 @@ body.board-gameover #puyo-board .puyo::after {
 @media (max-width: 380px) {
     .developer-weights { grid-template-columns: 1fr; }
 }
+
+
+/* Inline benchmark ZIP export */
+.benchmark-export-ready {
+    margin: 0 0 8px;
+    font-weight: 700;
+}
+.benchmark-export-progress,
+.benchmark-export-note {
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+.benchmark-zip-save-link,
+.benchmark-zip-share-button {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    text-align: center;
+    font: inherit;
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+}
+.benchmark-zip-save-link {
+    background: #457b9d;
+    color: #fff;
+}
+.benchmark-zip-share-button {
+    border: 0;
+    background: #2a9d8f;
+    color: #fff;
+}
+.benchmark-export-note {
+    margin-top: 8px;
+    opacity: 0.82;
+}

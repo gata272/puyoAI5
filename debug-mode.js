@@ -27,7 +27,8 @@
         lastBenchmarkLog: '',
         benchmarkRunId: '',
         benchmarkResult: null,
-        benchmarkDB: null
+        benchmarkDB: null,
+        exportingZip: false
     };
 
     function $(id) { return document.getElementById(id); }
@@ -88,6 +89,14 @@
             beamWidth: read('benchmark-beam', DEFAULTS.beamWidth, 1, 500),
             recordDecisionLog: $('benchmark-record-log')?.checked !== false
         };
+    }
+
+    function formatBytes(bytes) {
+        const value = Number(bytes) || 0;
+        if (value < 1024) return `${value} B`;
+        if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+        if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+        return `${(value / 1024 ** 3).toFixed(2)} GB`;
     }
 
     function formatPercent(count, games) {
@@ -308,30 +317,116 @@
         }
     }
 
-    function openBenchmarkExport(runId) {
-        if (!runId) return false;
-        const target = `./benchmark-export.html?runId=${encodeURIComponent(runId)}`;
-        // Open the export page synchronously while the click gesture is still
-        // active. iOS Safari may reject a download that is initiated only after
-        // an asynchronous IndexedDB/CompressionStream operation. The export
-        // page performs those asynchronous operations itself and exposes a
-        // normal user-tappable save link as a fallback.
-        let popup = null;
-        try {
-            popup = global.open(target, '_blank');
-        } catch (_) {
-            popup = null;
-        }
-        if (popup) return true;
+    let benchmarkZipObjectUrl = '';
 
-        // Popup blocking should never leave the user with no response.
-        // Navigating the current tab is the reliable fallback on mobile Safari.
+    function revokeBenchmarkZipUrl() {
+        if (!benchmarkZipObjectUrl) return;
+        try { global.URL.revokeObjectURL(benchmarkZipObjectUrl); } catch (_) {}
+        benchmarkZipObjectUrl = '';
+    }
+
+    function renderBenchmarkZipActions(container, blob, filename) {
+        revokeBenchmarkZipUrl();
+        benchmarkZipObjectUrl = global.URL.createObjectURL(blob);
+        container.innerHTML = '';
+
+        const title = document.createElement('div');
+        title.className = 'benchmark-export-ready';
+        title.textContent = `ZIPの準備が完了しました（${formatBytes(blob.size)}）`;
+
+        const saveLink = document.createElement('a');
+        saveLink.href = benchmarkZipObjectUrl;
+        saveLink.download = filename;
+        saveLink.textContent = 'ZIPを保存';
+        saveLink.className = 'benchmark-zip-save-link';
+
+        const shareButton = document.createElement('button');
+        shareButton.type = 'button';
+        shareButton.textContent = '共有 / ファイルに保存';
+        shareButton.className = 'benchmark-zip-share-button';
+        shareButton.addEventListener('click', async () => {
+            try {
+                const file = new File([blob], filename, { type: 'application/zip' });
+                if (!navigator.share || !navigator.canShare?.({ files: [file] })) {
+                    setStatus('このブラウザでは共有保存に対応していません。「ZIPを保存」を使ってください。');
+                    return;
+                }
+                await navigator.share({
+                    files: [file],
+                    title: 'PuyoAI ベンチマークログ'
+                });
+                setStatus('共有シートを開きました。必要に応じて「ファイルに保存」を選択してください。');
+            } catch (error) {
+                if (error?.name === 'AbortError') return;
+                console.error('[Benchmark ZIP share]', error);
+                setStatus(`共有に失敗しました: ${error?.message || error}`);
+            }
+        });
+
+        const note = document.createElement('div');
+        note.className = 'benchmark-export-note';
+        note.textContent = 'iPhone / iPadでは「共有 / ファイルに保存」が確実です。ZIPを保存する場合は青いボタンをタップしてください。';
+
+        container.append(title, saveLink, shareButton, note);
+        container.hidden = false;
+    }
+
+    async function exportBenchmarkZipInPage(runId) {
+        const actions = $('benchmark-log-actions');
+        if (!actions || !runId) {
+            setStatus('保存できるベンチマーク結果がありません');
+            return;
+        }
+
+        if (STATE.exportingZip) {
+            setStatus('ZIPを作成中です。完了するまでお待ちください。');
+            return;
+        }
+        STATE.exportingZip = true;
+        revokeBenchmarkZipUrl();
+        const original = actions.innerHTML;
+        actions.innerHTML = '<div class="benchmark-export-progress">ZIPを作成しています…</div>';
+        actions.hidden = false;
+        setStatus('詳細ログをZIPにまとめています…');
+
         try {
-            global.location.assign(target);
-            return true;
-        } catch (_) {
-            setStatus('ZIP保存画面を開けませんでした');
-            return false;
+            const db = await openBenchmarkDB();
+            const meta = await new Promise((resolve, reject) => {
+                const tx = db.transaction('runs', 'readonly');
+                const request = tx.objectStore('runs').get('latest');
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => reject(request.error || new Error('ベンチマーク情報を読み込めませんでした'));
+            });
+            if (!meta || meta.runId !== runId || meta.status !== 'complete' || !meta.result) {
+                throw new Error('完了済みのベンチマーク結果が見つかりません');
+            }
+
+            const moduleUrl = new URL('./benchmark-zip.js', document.baseURI).href;
+            const { createBenchmarkZip } = await import(moduleUrl);
+            const getGame = async (gameIndex) => new Promise((resolve, reject) => {
+                const tx = db.transaction('games', 'readonly');
+                const request = tx.objectStore('games').get(`${runId}:${gameIndex}`);
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => reject(request.error || new Error(`ゲーム${gameIndex + 1}のログを読み込めませんでした`));
+            });
+
+            const blob = await createBenchmarkZip(meta.result, getGame, (completed, total) => {
+                setStatus(`ZIPを作成中… ${completed} / ${total} ゲーム`);
+                const progress = actions.querySelector('.benchmark-export-progress');
+                if (progress) progress.textContent = `ZIPを作成中… ${completed} / ${total} ゲーム`;
+            });
+
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const filename = `puyoAI-benchmark-${stamp}.zip`;
+            renderBenchmarkZipActions(actions, blob, filename);
+            setStatus('ZIPの準備が完了しました。保存ボタンをタップしてください。');
+        } catch (error) {
+            console.error('[Benchmark ZIP export]', error);
+            actions.innerHTML = original;
+            actions.hidden = false;
+            setStatus(`ZIP作成に失敗しました: ${error?.message || error}`);
+        } finally {
+            STATE.exportingZip = false;
         }
     }
 
@@ -611,9 +706,10 @@
             setStatus('保存できるベンチマーク結果がありません');
             return;
         }
-        setStatus('ZIP保存画面を開いています…');
-        openBenchmarkExport(runId);
+        void exportBenchmarkZipInPage(runId);
     };
+
+    global.addEventListener('beforeunload', revokeBenchmarkZipUrl);
 
     global.initializeDebugMode = function () {
         setDebugMode(readBool());

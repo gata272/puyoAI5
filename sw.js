@@ -1,4 +1,4 @@
-const CACHE_NAME = 'puyo-sim-v9-benchmark-export-fix';
+const CACHE_NAME = 'puyo-sim-v10-inline-benchmark-export';
 
 const urlsToCache = [
     './',
@@ -13,8 +13,6 @@ const urlsToCache = [
     './puyoAI_wasm.mjs',
     './puyoAI_wasm.wasm',
     './benchmark-worker.js',
-    './benchmark-export.html',
-    './benchmark-export.js',
     './benchmark-zip.js',
     './manifest.json',
     './apple-touch-icon.png',
