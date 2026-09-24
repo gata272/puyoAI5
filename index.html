@@ -97,7 +97,7 @@
                     ベンチマーク中の全手を詳細記録する
                 </label>
                 <p style="font-size:0.7em; color:#999; line-height:1.4; margin:6px 0 8px;">
-                    各手の盤面・NEXT・選択手・連鎖結果・安全手数・AI内部デバッグログを記録します。ゲーム数やターン数が多い場合はログが大きくなります。
+                    各手の盤面・NEXT・選択手・連鎖結果・安全手数・AI内部デバッグログをゲーム単位で保存します。測定中はIndexedDBへ順次保存し、終了時に巨大なJSONを一括生成しません。
                 </p>
                 <button id="run-benchmark-button" onclick="runChainBenchmark()" disabled>最大連鎖ベンチマーク開始</button>
                 <div id="benchmark-status">準備中…</div>

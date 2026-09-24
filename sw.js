@@ -1,4 +1,4 @@
-const CACHE_NAME = 'puyo-sim-v7-benchmark-fix';
+const CACHE_NAME = 'puyo-sim-v8-incremental-benchmark-logs';
 
 const urlsToCache = [
     './',
@@ -8,6 +8,7 @@ const urlsToCache = [
     './online.js',
     './puyoSim.js',
     './puyoAI.js',
+    './debug-mode.js',
     './puyo-ai-worker-wasm.js',
     './puyoAI_wasm.mjs',
     './puyoAI_wasm.wasm',
