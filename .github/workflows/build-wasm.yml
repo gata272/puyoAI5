@@ -1,4 +1,4 @@
-name: Build WASM and Deploy to GitHub Pages
+Name: Build WASM and Deploy to GitHub Pages
 
 on:
   push:
@@ -56,7 +56,6 @@ jobs:
             ai/evaluation/game_history.cpp \
             -I. \
             -o native_test
-
           ./native_test
 
       - name: Trigger-structure regression test
@@ -75,7 +74,6 @@ jobs:
             ai/simulation/simulator.cpp \
             -I. \
             -o trigger_structure_test
-
           ./trigger_structure_test
 
       - name: Virtual-chain potential regression test
@@ -90,7 +88,6 @@ jobs:
             ai/simulation/simulator.cpp \
             -I. \
             -o virtual_chain_potential_test
-
           ./virtual_chain_potential_test
 
       - name: Main-chain policy regression test
@@ -103,7 +100,6 @@ jobs:
             ai/simulation/board.cpp \
             -I. \
             -o main_chain_test
-
           ./main_chain_test
 
       - name: Weight API regression test
@@ -115,10 +111,9 @@ jobs:
             ai/evaluation/weights.cpp \
             -I. \
             -o weight_api_test
-
           ./weight_api_test
 
-      -name: Chain benchmark regression test
+      - name: Chain benchmark regression test
         run: |
           g++ \
             -std=c++20 \
@@ -144,7 +139,6 @@ jobs:
             ai/evaluation/game_history.cpp \
             -I. \
             -o chain_benchmark_test
-
           ./chain_benchmark_test
 
       - name: Survival-horizon regression test
@@ -159,7 +153,6 @@ jobs:
             ai/simulation/simulator.cpp \
             -I. \
             -o survival_horizon_test
-
           ./survival_horizon_test
 
       - name: Game-history lifecycle regression test
@@ -172,7 +165,6 @@ jobs:
             ai/simulation/board.cpp \
             -I. \
             -o game_history_test
-
           ./game_history_test
 
       - name: Benchmark streaming regression test
@@ -204,7 +196,6 @@ jobs:
             ai/evaluation/game_history.cpp \
             -I. \
             -o benchmark_stream_test
-
           ./benchmark_stream_test
 
       - name: Build WASM
@@ -250,7 +241,6 @@ jobs:
       - name: Prepare Pages artifact
         run: |
           mkdir -p _site
-
           rsync -av \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -272,10 +262,8 @@ jobs:
             --exclude='puyoai_virtual_test' \
             --exclude='puyoai_benchmark_test' \
             ./ _site/
-
           cp puyoAI_wasm.mjs _site/puyoAI_wasm.mjs
           cp puyoAI_wasm.wasm _site/puyoAI_wasm.wasm
-
           echo "=== Pages artifact ==="
           find _site -maxdepth 3 -type f | sort
 
