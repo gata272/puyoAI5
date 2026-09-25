@@ -273,6 +273,8 @@ jobs:
             --exclude='main_chain_test' \
             --exclude='chain_benchmark_test' \
             --exclude='survival_horizon_test' \
+            --exclude='game_history_test' \
+            --exclude='benchmark_stream_test' \
             --exclude='puyoai_test' \
             --exclude='puyoai_construction_test' \
             --exclude='puyoai_virtual_test' \
@@ -283,7 +285,9 @@ jobs:
           cp puyoAI_wasm.wasm _site/puyoAI_wasm.wasm
 
           test -f _site/benchmark-zip.js
+          test -f _site/benchmark-export-worker.js
           test -f _site/debug-mode.js
+
           if grep -R --line-number --fixed-strings 'benchmark-export.html' _site >/tmp/benchmark_export_refs.txt; then
             echo 'ERROR: stale benchmark-export.html reference remains in Pages artifact:'
             cat /tmp/benchmark_export_refs.txt
