@@ -28,7 +28,9 @@
         benchmarkRunId: '',
         benchmarkResult: null,
         benchmarkDB: null,
-        exportingZip: false
+        exportingZip: false,
+        exportWorker: null,
+        exportTimer: 0
     };
 
     function $(id) { return document.getElementById(id); }
@@ -279,6 +281,26 @@
         });
     }
 
+    async function readBenchmarkGame(runId, gameIndex) {
+        const db = await openBenchmarkDB();
+        return await new Promise((resolve, reject) => {
+            const tx = db.transaction('games', 'readonly');
+            const request = tx.objectStore('games').get(`${runId}:${gameIndex}`);
+            request.onsuccess = () => {
+                const record = request.result || null;
+                if (!record || typeof record.json !== 'string') {
+                    reject(new Error(`ゲーム${gameIndex + 1}のログがIndexedDBにありません`));
+                    return;
+                }
+                resolve(record.json);
+            };
+            request.onerror = () => reject(
+                request.error || new Error(`ゲーム${gameIndex + 1}のログを読み込めませんでした`)
+            );
+            tx.onabort = () => reject(tx.error || new Error(`ゲーム${gameIndex + 1}のログ読み込みが中断されました`));
+        });
+    }
+
     async function updateBenchmarkRunMeta(fields) {
         const db = await openBenchmarkDB();
         await new Promise((resolve, reject) => {
@@ -397,14 +419,35 @@
         container.hidden = false;
     }
 
+    function cleanupExportWorker() {
+        if (STATE.exportTimer) {
+            global.clearTimeout(STATE.exportTimer);
+            STATE.exportTimer = 0;
+        }
+        if (STATE.exportWorker) {
+            try { STATE.exportWorker.terminate(); } catch (_) {}
+            STATE.exportWorker = null;
+        }
+    }
+
+    function armExportTimeout(runId, stage) {
+        if (STATE.exportTimer) global.clearTimeout(STATE.exportTimer);
+        STATE.exportTimer = global.setTimeout(() => {
+            if (!STATE.exportingZip || STATE.benchmarkRunId !== runId) return;
+            cleanupExportWorker();
+            STATE.exportingZip = false;
+            const actions = $('benchmark-log-actions');
+            if (actions) actions.innerHTML = '<button type=\"button\" onclick=\"downloadBenchmarkLog()\">詳細ログをZIP保存</button>';
+            if (actions) actions.hidden = false;
+            setStatus(`ZIP作成がタイムアウトしました（${stage}）。もう一度試してください。`);
+        }, 90000);
+    }
+
     async function exportBenchmarkZipInPage(runId) {
         const actions = $('benchmark-log-actions');
-        if (!actions || !runId) {
+        const result = STATE.benchmarkResult;
+        if (!actions || !runId || !result) {
             setStatus('保存できるベンチマーク結果がありません');
-            return;
-        }
-        if (!STATE.worker || !STATE.ready) {
-            setStatus('ベンチマークWorkerが準備できていません。ページを再読み込みして再試行してください。');
             return;
         }
         if (STATE.running) {
@@ -415,13 +458,134 @@
             setStatus('ZIPを作成中です。完了するまでお待ちください。');
             return;
         }
+        if (!STATE.ready) {
+            setStatus('ベンチマークWorkerが準備できていません。ページを再読み込みして再試行してください。');
+            return;
+        }
 
+        cleanupExportWorker();
+        let worker;
+        try {
+            worker = new Worker('./benchmark-export-worker.js', { type: 'module' });
+        } catch (error) {
+            setStatus(`ZIP専用Workerの起動に失敗しました: ${error?.message || error}`);
+            return;
+        }
+
+        STATE.exportWorker = worker;
         STATE.exportingZip = true;
-        revokeBenchmarkZipUrl();
-        actions.innerHTML = '<div class="benchmark-export-progress">ZIPを作成しています…</div>';
+        actions.innerHTML = '<div class=\"benchmark-export-progress\">ZIPの準備を開始しています…</div>';
         actions.hidden = false;
-        setStatus('詳細ログをWorkerでZIPにまとめています…');
-        STATE.worker.postMessage({ type: 'exportZip', runId });
+        setStatus('ZIP専用Workerを準備しています…');
+        armExportTimeout(runId, '準備');
+
+        let nextGame = 0;
+        const totalGames = Math.max(0, Number(result.games) || 0);
+
+        const finishWithError = (message) => {
+            cleanupExportWorker();
+            STATE.exportingZip = false;
+            if (actions) {
+                actions.innerHTML = '<button type=\"button\" onclick=\"downloadBenchmarkLog()\">詳細ログをZIP保存</button>';
+                actions.hidden = false;
+            }
+            setStatus(`ZIP作成に失敗しました: ${message}`);
+            console.error('[Benchmark ZIP export]', message);
+        };
+
+        const pumpGame = async () => {
+            if (!STATE.exportingZip || !STATE.exportWorker || STATE.benchmarkRunId !== runId) return;
+            if (nextGame >= totalGames) {
+                actions.querySelector('.benchmark-export-progress').textContent = 'ZIPを完成しています…';
+                setStatus('ZIPを完成しています…');
+                armExportTimeout(runId, '最終化');
+                worker.postMessage({ type: 'finishExport', runId });
+                return;
+            }
+
+            const gameIndex = nextGame;
+            const progressText = `ゲーム ${gameIndex + 1} / ${totalGames} のログを読み込み中…`;
+            const progress = actions.querySelector('.benchmark-export-progress');
+            if (progress) progress.textContent = progressText;
+            setStatus(progressText);
+            armExportTimeout(runId, `ゲーム${gameIndex + 1}の読み込み`);
+
+            try {
+                const json = await readBenchmarkGame(runId, gameIndex);
+                if (!STATE.exportingZip || !STATE.exportWorker || STATE.benchmarkRunId !== runId) return;
+                const bytes = new TextEncoder().encode(json);
+                const buffer = bytes.buffer;
+                const compressText = `ゲーム ${gameIndex + 1} / ${totalGames} を圧縮中…`;
+                if (progress) progress.textContent = compressText;
+                setStatus(compressText);
+                armExportTimeout(runId, `ゲーム${gameIndex + 1}の圧縮`);
+                worker.postMessage({
+                    type: 'appendGame',
+                    runId,
+                    gameIndex,
+                    jsonBytes: buffer
+                }, [buffer]);
+            } catch (error) {
+                finishWithError(error?.message || String(error));
+            }
+        };
+
+        worker.onmessage = async (event) => {
+            const msg = event.data || {};
+            if (msg.runId && msg.runId !== runId) return;
+
+            if (msg.type === 'exportStarted') {
+                const total = Number(msg.totalGames) || totalGames;
+                const progress = actions.querySelector('.benchmark-export-progress');
+                if (progress) progress.textContent = `ZIPを作成中… 0 / ${total} ゲーム`;
+                setStatus(`ZIPを作成中… 0 / ${total} ゲーム`);
+                armExportTimeout(runId, '1件目の読み込み');
+                void pumpGame();
+                return;
+            }
+
+            if (msg.type === 'exportProgress') {
+                const completed = Number(msg.completed) || 0;
+                const total = Number(msg.total) || totalGames;
+                nextGame = completed;
+                const progress = actions.querySelector('.benchmark-export-progress');
+                if (progress) progress.textContent = `ZIPを作成中… ${completed} / ${total} ゲーム`;
+                setStatus(`ZIPを作成中… ${completed} / ${total} ゲーム`);
+                armExportTimeout(runId, completed < total ? `ゲーム${completed + 1}の読み込み` : '最終化');
+                void pumpGame();
+                return;
+            }
+
+            if (msg.type === 'exportComplete') {
+                cleanupExportWorker();
+                STATE.exportingZip = false;
+                if (!msg.blob || typeof msg.blob.size !== 'number' || msg.blob.size <= 22) {
+                    finishWithError('生成されたZIPが空または破損しています');
+                    return;
+                }
+                renderBenchmarkZipActions(actions, msg.blob, String(msg.filename || 'puyoAI-benchmark.zip'));
+                setStatus('ZIPの準備が完了しました。保存ボタンをタップしてください。');
+                return;
+            }
+
+            if (msg.type === 'exportError') {
+                finishWithError(msg.message || '不明なエラー');
+                return;
+            }
+        };
+
+        worker.onerror = (event) => {
+            finishWithError(event?.message || 'ZIP専用Workerでエラーが発生しました');
+        };
+        worker.onmessageerror = () => {
+            finishWithError('ZIP専用Workerとのデータ通信に失敗しました');
+        };
+
+        try {
+            worker.postMessage({ type: 'startExport', runId, result });
+        } catch (error) {
+            finishWithError(error?.message || String(error));
+        }
     }
 
     function initWorker() {

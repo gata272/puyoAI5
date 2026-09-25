@@ -1,4 +1,8 @@
-/* Small, dependency-free ZIP writer used by the benchmark export page. */
+/* Small, dependency-free ZIP writer used by benchmark export workers. */
+
+const ZIP_UINT16_MAX = 0xFFFF;
+const ZIP_UINT32_MAX = 0xFFFFFFFF;
+const COMPRESSION_CHUNK_SIZE = 64 * 1024;
 
 export function crc32(bytes) {
     if (!crc32.table) {
@@ -20,7 +24,7 @@ export function crc32(bytes) {
 }
 
 function dosDateTime(date = new Date()) {
-    const year = Math.max(1980, date.getFullYear());
+    const year = Math.min(2107, Math.max(1980, date.getFullYear()));
     return {
         dosTime:
             (date.getHours() << 11) |
@@ -73,6 +77,8 @@ function makeZipEnd(entries, centralDirectorySize, centralDirectoryOffset) {
     const end = new Uint8Array(22);
     const view = new DataView(end.buffer);
     view.setUint32(0, 0x06054B50, true);
+    view.setUint16(4, 0, true);
+    view.setUint16(6, 0, true);
     view.setUint16(8, entries, true);
     view.setUint16(10, entries, true);
     view.setUint32(12, centralDirectorySize >>> 0, true);
@@ -80,18 +86,78 @@ function makeZipEnd(entries, centralDirectorySize, centralDirectoryOffset) {
     return end;
 }
 
-async function compressDeflate(bytes) {
-    if (typeof globalThis.CompressionStream !== 'function') {
+function concatChunks(chunks, totalLength) {
+    const output = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+        output.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return output;
+}
+
+/**
+ * Compress one payload for ZIP method 8 without deadlocking the browser stream.
+ *
+ * CompressionStream has backpressure between its writable and readable sides.
+ * The old implementation waited for writer.close() before consuming readable,
+ * which can stall forever for sufficiently large logs.  This implementation
+ * starts the reader first and writes in bounded chunks so both sides advance.
+ */
+export async function compressBytesForZip(bytes) {
+    if (!(bytes instanceof Uint8Array)) {
+        throw new TypeError('圧縮対象はUint8Arrayである必要があります');
+    }
+    if (bytes.length === 0 || typeof globalThis.CompressionStream !== 'function') {
         return { method: 0, bytes };
     }
+
+    let stream;
+    let writer;
+    let reader;
     try {
-        const stream = new globalThis.CompressionStream('deflate');
-        const writer = stream.writable.getWriter();
-        await writer.write(bytes);
-        await writer.close();
-        const wrapped = new Uint8Array(await new Response(stream.readable).arrayBuffer());
-        // Browser CompressionStream("deflate") uses the zlib container;
-        // ZIP method 8 stores raw DEFLATE, so remove header/trailer.
+        stream = new globalThis.CompressionStream('deflate');
+        writer = stream.writable.getWriter();
+        reader = stream.readable.getReader();
+
+        const outputChunks = [];
+        let outputLength = 0;
+        let readError = null;
+
+        const readPromise = (async () => {
+            try {
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (!value || value.byteLength === 0) continue;
+                    const chunk = value instanceof Uint8Array
+                        ? value
+                        : new Uint8Array(value);
+                    outputChunks.push(chunk);
+                    outputLength += chunk.byteLength;
+                }
+            } catch (error) {
+                readError = error;
+            }
+        })();
+
+        try {
+            for (let offset = 0; offset < bytes.length; offset += COMPRESSION_CHUNK_SIZE) {
+                await writer.write(bytes.subarray(offset, Math.min(offset + COMPRESSION_CHUNK_SIZE, bytes.length)));
+            }
+            await writer.close();
+        } catch (error) {
+            try { await writer.abort(error); } catch (_) {}
+            throw error;
+        }
+
+        await readPromise;
+        if (readError) throw readError;
+
+        const wrapped = concatChunks(outputChunks, outputLength);
+        // CompressionStream("deflate") produces a zlib-wrapped DEFLATE stream.
+        // ZIP method 8 expects the raw DEFLATE payload, so remove the zlib header
+        // and Adler-32 trailer. Keep the entry uncompressed when it saves no space.
         if (wrapped.length <= 6) return { method: 0, bytes };
         const raw = wrapped.subarray(2, wrapped.length - 4);
         return raw.length < bytes.length
@@ -99,39 +165,50 @@ async function compressDeflate(bytes) {
             : { method: 0, bytes };
     } catch (_) {
         return { method: 0, bytes };
+    } finally {
+        try { reader?.releaseLock(); } catch (_) {}
+        try { writer?.releaseLock(); } catch (_) {}
     }
 }
 
 /**
- * Build a ZIP archive from benchmark summary + one-game JSON records.
- *
- * readGame(gameIndex) must return either the raw JSON string or an object with
- * a string `json` property. It is called sequentially so only one stored game
- * payload is pulled from IndexedDB at a time.
+ * Incremental ZIP builder. The caller can append one game at a time and finalize
+ * only after the last game. This is used by the dedicated export Worker so the
+ * benchmark Worker and IndexedDB are never coupled during ZIP creation.
  */
-export async function createBenchmarkZip(result, readGame, onProgress = () => {}) {
-    if (!result || typeof result !== 'object') throw new Error('ベンチマーク結果が不正です');
-    if (typeof readGame !== 'function') throw new Error('ゲームログ読み込み関数が指定されていません');
+export function createBenchmarkZipBuilder(result) {
+    if (!result || typeof result !== 'object') {
+        throw new Error('ベンチマーク結果が不正です');
+    }
 
     const encoder = new TextEncoder();
     const parts = [];
     const central = [];
     const { dosTime, dosDate } = dosDateTime();
     let offset = 0;
+    let finalized = false;
 
-    const append = async (name, sourceText) => {
-        const bytes = typeof sourceText === 'string' ? encoder.encode(sourceText) : sourceText;
-        if (!(bytes instanceof Uint8Array)) throw new Error(`ZIPエントリがUint8Arrayではありません: ${name}`);
-        if (bytes.length > 0xFFFFFFFF || offset > 0xFFFFFFFF) {
+    async function appendEntry(name, source) {
+        if (finalized) throw new Error('ZIPはすでに完成しています');
+        const bytes = typeof source === 'string' ? encoder.encode(source) : source;
+        if (!(bytes instanceof Uint8Array)) {
+            throw new Error(`ZIPエントリがUint8Arrayではありません: ${name}`);
+        }
+        if (bytes.length > ZIP_UINT32_MAX || offset > ZIP_UINT32_MAX) {
             throw new Error('ZIP形式の4GiB制限を超えています。試行数を分割してください');
         }
+
+        const nameBytes = encoder.encode(name);
+        if (nameBytes.length > ZIP_UINT16_MAX) {
+            throw new Error(`ファイル名が長すぎます: ${name}`);
+        }
+
         const crc = crc32(bytes);
-        const compressed = await compressDeflate(bytes);
-        if (compressed.bytes.length > 0xFFFFFFFF) {
+        const compressed = await compressBytesForZip(bytes);
+        if (compressed.bytes.length > ZIP_UINT32_MAX) {
             throw new Error('圧縮後のサイズがZIPの上限を超えています');
         }
-        const nameBytes = encoder.encode(name);
-        if (nameBytes.length > 0xFFFF) throw new Error(`ファイル名が長すぎます: ${name}`);
+
         const local = makeZipLocalHeader(
             nameBytes,
             compressed.method,
@@ -142,9 +219,10 @@ export async function createBenchmarkZip(result, readGame, onProgress = () => {}
             dosDate
         );
         const nextOffset = offset + local.length + compressed.bytes.length;
-        if (nextOffset > 0xFFFFFFFF) {
+        if (nextOffset > ZIP_UINT32_MAX) {
             throw new Error('ZIP形式の4GiB制限を超えています。試行数を分割してください');
         }
+
         parts.push(local, compressed.bytes);
         central.push(makeZipCentralHeader(
             nameBytes,
@@ -157,17 +235,60 @@ export async function createBenchmarkZip(result, readGame, onProgress = () => {}
             offset
         ));
         offset = nextOffset;
-    };
 
-    await append('summary.json', `${JSON.stringify(result, null, 2)}\n`);
-    await append('README.txt', [
-        'PuyoAI benchmark log archive',
-        '',
-        'summary.json: benchmark-wide summary.',
-        'game_XXXX.json: one game, including per-turn decision logs when enabled.',
-        'Logs are stored independently in IndexedDB while the benchmark runs.',
-        ''
-    ].join('\n'));
+        return {
+            name,
+            method: compressed.method,
+            originalSize: bytes.length,
+            compressedSize: compressed.bytes.length
+        };
+    }
+
+    async function appendStandardFiles() {
+        await appendEntry('summary.json', `${JSON.stringify(result, null, 2)}\n`);
+        await appendEntry('README.txt', [
+            'PuyoAI benchmark log archive',
+            '',
+            'summary.json: benchmark-wide summary.',
+            'game_XXXX.json: one game, including per-turn decision logs when enabled.',
+            'Logs are stored independently in IndexedDB while the benchmark runs.',
+            ''
+        ].join('\n'));
+    }
+
+    function finalize() {
+        if (finalized) throw new Error('ZIPはすでに完成しています');
+        finalized = true;
+        const centralOffset = offset;
+        const centralSize = central.reduce((sum, item) => sum + item.length, 0);
+        if (centralOffset > ZIP_UINT32_MAX || centralSize > ZIP_UINT32_MAX || central.length > ZIP_UINT16_MAX) {
+            throw new Error('ZIP形式の上限を超えています。試行数を分割してください');
+        }
+        parts.push(...central, makeZipEnd(central.length, centralSize, centralOffset));
+        return new Blob(parts, { type: 'application/zip' });
+    }
+
+    return {
+        appendEntry,
+        appendStandardFiles,
+        finalize,
+        get entryCount() { return central.length; },
+        get currentOffset() { return offset; }
+    };
+}
+
+/**
+ * Backward-compatible convenience API used by unit tests and any external code.
+ * It still processes one game at a time and therefore does not build the raw
+ * benchmark JSON in one giant object.
+ */
+export async function createBenchmarkZip(result, readGame, onProgress = () => {}) {
+    if (typeof readGame !== 'function') {
+        throw new Error('ゲームログ読み込み関数が指定されていません');
+    }
+
+    const builder = createBenchmarkZipBuilder(result);
+    await builder.appendStandardFiles();
 
     const totalGames = Math.max(0, Number(result.games) || 0);
     for (let game = 0; game < totalGames; game += 1) {
@@ -177,15 +298,9 @@ export async function createBenchmarkZip(result, readGame, onProgress = () => {}
             throw new Error(`ゲーム${game + 1}のログがIndexedDBにありません`);
         }
         const suffix = String(game + 1).padStart(4, '0');
-        await append(`game_${suffix}.json`, json);
+        await builder.appendEntry(`game_${suffix}.json`, json);
         onProgress(game + 1, totalGames);
     }
 
-    const centralOffset = offset;
-    const centralSize = central.reduce((sum, item) => sum + item.length, 0);
-    if (centralOffset > 0xFFFFFFFF || centralSize > 0xFFFFFFFF || central.length > 0xFFFF) {
-        throw new Error('ZIP形式の上限を超えています。試行数を分割してください');
-    }
-    parts.push(...central, makeZipEnd(central.length, centralSize, centralOffset));
-    return new Blob(parts, { type: 'application/zip' });
+    return builder.finalize();
 }

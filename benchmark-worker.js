@@ -8,14 +8,12 @@
  * starting the next game.
  */
 import createPuyoAI from './puyoAI_wasm.mjs';
-import { createBenchmarkZip } from './benchmark-zip.js';
 
 let moduleInstance = null;
 let runBenchmarkGame = null;
 let initializing = null;
 let activeRunId = null;
 let pendingStoreAck = null;
-let exportingZip = false;
 
 async function init() {
     if (initializing) return initializing;
@@ -68,104 +66,6 @@ function waitForGameStored(runId, gameIndex) {
     });
 }
 
-
-const BENCHMARK_DB_NAME = 'puyoAI-benchmark-logs';
-const BENCHMARK_DB_VERSION = 1;
-
-function openBenchmarkLogDB() {
-    if (!('indexedDB' in self)) {
-        return Promise.reject(new Error('このWorkerではIndexedDBが利用できません'));
-    }
-    return new Promise((resolve, reject) => {
-        const request = self.indexedDB.open(BENCHMARK_DB_NAME, BENCHMARK_DB_VERSION);
-        request.onupgradeneeded = () => {
-            const db = request.result;
-            if (!db.objectStoreNames.contains('runs')) {
-                db.createObjectStore('runs', { keyPath: 'id' });
-            }
-            if (!db.objectStoreNames.contains('games')) {
-                const games = db.createObjectStore('games', { keyPath: 'id' });
-                games.createIndex('runId', 'runId', { unique: false });
-            }
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error || new Error('ベンチマークIndexedDBを開けませんでした'));
-    });
-}
-
-function readBenchmarkRun(db) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction('runs', 'readonly');
-        const request = tx.objectStore('runs').get('latest');
-        request.onsuccess = () => resolve(request.result || null);
-        request.onerror = () => reject(request.error || new Error('ベンチマーク結果を読み込めませんでした'));
-    });
-}
-
-function readBenchmarkGame(db, runId, gameIndex) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction('games', 'readonly');
-        const request = tx.objectStore('games').get(`${runId}:${gameIndex}`);
-        request.onsuccess = () => {
-            const record = request.result || null;
-            if (!record || typeof record.json !== 'string') {
-                reject(new Error(`ゲーム${gameIndex + 1}のログがIndexedDBにありません`));
-                return;
-            }
-            resolve(record.json);
-        };
-        request.onerror = () => reject(
-            request.error || new Error(`ゲーム${gameIndex + 1}のログを読み込めませんでした`)
-        );
-    });
-}
-
-async function exportBenchmarkZip(runId) {
-    if (exportingZip) {
-        throw new Error('ZIPを作成中です。完了するまでお待ちください。');
-    }
-    if (activeRunId) {
-        throw new Error('ベンチマーク実行中はZIPを作成できません');
-    }
-
-    exportingZip = true;
-    let db = null;
-    try {
-        db = await openBenchmarkLogDB();
-        const meta = await readBenchmarkRun(db);
-        if (!meta || meta.runId !== runId || meta.status !== 'complete' || !meta.result) {
-            throw new Error('完了済みのベンチマーク結果が見つかりません');
-        }
-
-        const totalGames = Math.max(0, Number(meta.result.games) || 0);
-        if (totalGames === 0) throw new Error('ZIPに保存するゲームログがありません');
-
-        self.postMessage({ type: 'exportStarted', runId, totalGames });
-        const blob = await createBenchmarkZip(
-            meta.result,
-            (gameIndex) => readBenchmarkGame(db, runId, gameIndex),
-            (completed, total) => {
-                self.postMessage({
-                    type: 'exportProgress',
-                    runId,
-                    completed,
-                    total
-                });
-            }
-        );
-
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        self.postMessage({
-            type: 'exportComplete',
-            runId,
-            filename: `puyoAI-benchmark-${stamp}.zip`,
-            blob
-        });
-    } finally {
-        try { db?.close(); } catch (_) {}
-        exportingZip = false;
-    }
-}
 
 function aggregatePercentile(values, p) {
     if (!values.length) return 0;
@@ -401,18 +301,6 @@ self.onmessage = async (event) => {
         return;
     }
 
-    if (msg.type === 'exportZip') {
-        try {
-            await exportBenchmarkZip(msg.runId);
-        } catch (error) {
-            self.postMessage({
-                type: 'exportError',
-                runId: msg.runId,
-                message: error?.message || String(error)
-            });
-        }
-        return;
-    }
 
     if (msg.type !== 'run') return;
     if (activeRunId) {
