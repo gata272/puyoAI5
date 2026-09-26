@@ -6,6 +6,8 @@
 #include <sstream>
 
 #include <algorithm>
+#include <limits>
+#include <numeric>
 
 namespace puyo {
 
@@ -88,7 +90,7 @@ Move AI::chooseMove(
 
     patternName_.clear();
 
-    const Move selected = search_.chooseMove(
+    Move selected = search_.chooseMove(
         board,
         pieces,
         weights_,
@@ -96,6 +98,59 @@ Move AI::chooseMove(
         std::max(1, beamWidth),
         history_
     );
+
+    // Final hard safety guard. The search already reserves safe candidates,
+    // but this check is intentionally outside the scorer so a future scoring
+    // change can never reintroduce the old failure mode: selecting a
+    // game-over placement while at least one safe placement exists. It only
+    // runs on an invalid/death selection, so it cannot perturb normal
+    // long-chain ranking.
+    bool needsFallback = !selected.valid;
+    SimulationResult selectedSim{};
+    if (selected.valid) {
+        selectedSim = Simulator::drop(board, pieces.front(), selected);
+        needsFallback = selectedSim.gameOver && !selectedSim.allClear;
+    }
+
+    if (needsFallback) {
+        const auto legal = generateLegalMoves(board, pieces.front());
+        Move bestSafe{-1, 0, false};
+        long long bestSafeValue = std::numeric_limits<long long>::min();
+        bool anySafe = false;
+
+        for (const auto& move : legal) {
+            const auto sim = Simulator::drop(board, pieces.front(), move);
+            if (sim.gameOver && !sim.allClear) continue;
+            anySafe = true;
+
+            const auto heights = sim.board.heights();
+            const int maxHeight = *std::max_element(heights.begin(), heights.end());
+            const int occupied = std::accumulate(heights.begin(), heights.end(), 0);
+            const long long value =
+                static_cast<long long>(sim.chains) * 1000000LL +
+                static_cast<long long>(std::max(0, sim.erased)) * 10000LL -
+                static_cast<long long>(maxHeight) * 1000LL -
+                static_cast<long long>(occupied) * 10LL;
+
+            if (bestSafe.x < 0 || value > bestSafeValue) {
+                bestSafe = move;
+                bestSafeValue = value;
+            }
+        }
+
+        if (anySafe) {
+            if (debugLoggingEnabled()) {
+                std::ostringstream oss;
+                oss << "[AI-DEBUG] FINAL-SAFETY-FALLBACK selected=("
+                    << (selected.valid ? selected.x : -1) << ","
+                    << (selected.valid ? selected.rotation : -1) << ")"
+                    << " fallback=(" << bestSafe.x << "," << bestSafe.rotation << ")";
+                debugLog(oss.str());
+            }
+            selected = bestSafe;
+        }
+    }
+
     observeChosenMove(turn, board, pieces, selected);
     return selected;
 }
