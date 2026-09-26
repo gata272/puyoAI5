@@ -106,6 +106,32 @@ int main() {
         puyo::setDebugConsoleLogging(true);
     }
 
+    // Final safety regression: on a near-full board where some placements are
+    // still safe and others would immediately lose, the public AI entry point
+    // must never return a death placement. This is intentionally a shallow
+    // search so the test remains cheap.
+    {
+        puyo::Board nearDeath;
+        for (int x = 0; x < puyo::BOARD_WIDTH; ++x) {
+            const int height = (x == 2) ? 10 : 11;
+            for (int y = 0; y < height; ++y) {
+                nearDeath.set(
+                    x, y,
+                    static_cast<puyo::Cell>(1 + ((x + 2 * y) % 4))
+                );
+            }
+        }
+        std::vector<puyo::PuyoPair> nearDeathPieces = {
+            {1, 2}, {3, 4}, {2, 1}
+        };
+        puyo::AI safetyAI;
+        const auto safetyMove = safetyAI.chooseMove(3, nearDeath, nearDeathPieces, 1, 4);
+        assert(safetyMove.valid);
+        const auto safetySim = puyo::Simulator::drop(
+            nearDeath, nearDeathPieces.front(), safetyMove);
+        assert(!safetySim.gameOver || safetySim.allClear);
+    }
+
     std::cout << "native AI smoke test passed: "
               << next.x << "," << next.rotation << "\n";
     return 0;
