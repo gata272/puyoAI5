@@ -58,24 +58,14 @@ struct Node {
     double survivalScore = 0.0;
     bool hasSurvival = false;
 
-    // Path-level survival memory.  The previous implementation only scored the
-    // current node's mobility, so a branch could pass through a catastrophic
-    // 0-1-safe-move state and later look healthy again after a cheap probe.
-    // Keep the worst observed horizon and cumulative mobility loss along the
-    // whole searched path.
-    int worstFutureSafeMoves = 99;
-    int worstNext2SafeMoves = 99;
-    int survivalWarnings = 0;
-    int survivalDrop = 0;
-
-    // True, visible-piece trigger probe.  `virtualPotential` may use arbitrary
-    // colour pairs, so it can remain high even when the actual next pieces
-    // cannot fire the stored construction.  These fields measure the latter.
-    int trueTriggerPath = 0;
-    int trueImmediateChains = 0;
-    int trueFollowupChains = 0;
-    int trueTriggerMoves = 0;
-    int trueFollowupSafeMoves = 0;
+    // Root-action diagnostics used only by the emergency selector. These are
+    // deliberately not part of the ordinary beam/final utility.
+    int rootTrueTriggerPath = 0;
+    int rootTrueImmediateChains = 0;
+    int rootTrueFollowupChains = 0;
+    int rootTriggerRoute = 0;
+    int rootMaxHeight = 0;
+    int rootDangerHeight = 0;
 
     bool gameOver = false;
     std::uint64_t boardHash = 0;
@@ -203,15 +193,12 @@ std::vector<Node> expandNode(
         candidate.bestNextSafeMoves = -1;
         candidate.survivalScore = 0.0;
         candidate.hasSurvival = false;
-        candidate.worstFutureSafeMoves = parent.worstFutureSafeMoves;
-        candidate.worstNext2SafeMoves = parent.worstNext2SafeMoves;
-        candidate.survivalWarnings = parent.survivalWarnings;
-        candidate.survivalDrop = parent.survivalDrop;
-        candidate.trueTriggerPath = 0;
-        candidate.trueImmediateChains = 0;
-        candidate.trueFollowupChains = 0;
-        candidate.trueTriggerMoves = 0;
-        candidate.trueFollowupSafeMoves = 0;
+        candidate.rootTrueTriggerPath = parent.rootTrueTriggerPath;
+        candidate.rootTrueImmediateChains = parent.rootTrueImmediateChains;
+        candidate.rootTrueFollowupChains = parent.rootTrueFollowupChains;
+        candidate.rootTriggerRoute = parent.rootTriggerRoute;
+        candidate.rootMaxHeight = parent.rootMaxHeight;
+        candidate.rootDangerHeight = parent.rootDangerHeight;
         candidate.gameOver = deathMove;
 
         if (deathMove) death.push_back(std::move(candidate));
@@ -251,22 +238,8 @@ double survivalCorrection(const Node& n) {
     return n.survivalScore * std::clamp(protection, 0.52, 1.0);
 }
 
-double pathSurvivalCorrection(const Node& n) {
-    double penalty = 0.0;
-    if (n.worstFutureSafeMoves <= 0) penalty -= 90000.0;
-    else if (n.worstFutureSafeMoves == 1) penalty -= 30000.0;
-    else if (n.worstFutureSafeMoves == 2) penalty -= 9000.0;
-    else if (n.worstFutureSafeMoves == 3) penalty -= 2500.0;
-
-    if (n.worstNext2SafeMoves <= 0) penalty -= 18000.0;
-    else if (n.worstNext2SafeMoves == 1) penalty -= 6000.0;
-
-    penalty -= std::min(18000.0, static_cast<double>(n.survivalDrop) * 900.0);
-    return penalty;
-}
-
 double beamUtility(const Node& n) {
-    return n.score + survivalCorrection(n) + pathSurvivalCorrection(n);
+    return n.score + survivalCorrection(n);
 }
 
 bool betterForBeam(const Node& a, const Node& b) {
@@ -437,24 +410,24 @@ void applySurvivalProbe(
         node.bestNextGeometricMoves = h.bestNextGeometricMoves;
         node.bestNextSafeMoves = h.bestNextSafeMoves;
         node.survivalScore = survivalHorizonScore(h, previousSafeMoves, previousGeometricMoves);
-        node.trueTriggerPath = h.trueTriggerPath;
-        node.trueImmediateChains = h.trueImmediateChains;
-        node.trueFollowupChains = h.trueFollowupChains;
-        node.trueTriggerMoves = h.trueTriggerMoves;
-        node.trueFollowupSafeMoves = h.trueFollowupSafeMoves;
 
-        // Preserve the worst point reached anywhere on the path.  A branch
-        // that briefly reaches zero/one safe move is dangerous even if the
-        // following simulated placement happens to clear space again.
-        if (h.safeMoves >= 0) {
-            node.worstFutureSafeMoves = std::min(node.worstFutureSafeMoves, h.safeMoves);
-            if (h.safeMoves <= 3) ++node.survivalWarnings;
-        }
-        if (h.bestNextSafeMoves >= 0) {
-            node.worstNext2SafeMoves = std::min(node.worstNext2SafeMoves, h.bestNextSafeMoves);
-        }
-        if (previousSafeMoves >= 0 && h.safeMoves >= 0 && h.safeMoves < previousSafeMoves) {
-            node.survivalDrop += previousSafeMoves - h.safeMoves;
+        // The exact visible-piece path is collected only for root actions in
+        // the danger/transition zone. It is an emergency diagnostic, never a
+        // normal construction score. The richer survival_horizon probe uses
+        // only the currently visible next two pairs.
+        if (depth == 1) {
+            const bool emergencyProbe =
+                h.safeMoves >= 0 && h.safeMoves <= 5 &&
+                (maxHeight >= 11 || heights[2] >= 9 ||
+                 (h.bestNextSafeMoves >= 0 && h.bestNextSafeMoves <= 2));
+            if (emergencyProbe) {
+                node.rootTrueTriggerPath = h.trueTriggerPath;
+                node.rootTrueImmediateChains = h.trueImmediateChains;
+                node.rootTrueFollowupChains = h.trueFollowupChains;
+                node.rootMaxHeight = maxHeight;
+                node.rootDangerHeight = heights[2];
+                node.rootTriggerRoute = triggerRouteLength(node.board);
+            }
         }
 
         // Keep the root-level mobility measurement attached to the root action
@@ -468,7 +441,6 @@ void applySurvivalProbe(
         node.hasSurvival = true;
     }
 }
-
 
 void applyVirtualRerank(std::vector<Node>& beam, int topM) {
     if (beam.empty() || topM <= 0) return;
@@ -539,15 +511,10 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " next2Geom=" << x.bestNextGeometricMoves
             << " next2Safe=" << x.bestNextSafeMoves
             << " survival=" << x.survivalScore
-            << " worstSafe=" << x.worstFutureSafeMoves
-            << " worstNext2Safe=" << x.worstNext2SafeMoves
-            << " survivalWarn=" << x.survivalWarnings
-            << " survivalDrop=" << x.survivalDrop
-            << " truePath=" << x.trueTriggerPath
-            << " trueNow=" << x.trueImmediateChains
-            << " trueFollow=" << x.trueFollowupChains
-            << " trueTrigMoves=" << x.trueTriggerMoves
-            << " trueFollowSafe=" << x.trueFollowupSafeMoves
+            << " rootTruePath=" << x.rootTrueTriggerPath
+            << " rootTrueNow=" << x.rootTrueImmediateChains
+            << " rootTrueFollow=" << x.rootTrueFollowupChains
+            << " rootRoute=" << x.rootTriggerRoute
             << " rootSafe=" << x.rootFutureSafeMoves
             << " structure=" << x.structure
             << " mainChain=" << x.mainChain.length()
@@ -586,33 +553,11 @@ double finalUtility(const Node& n) {
          n.construction * 0.06 -
          n.prematureRisk * 0.06) * constructionGate;
 
-    // A path that ever reaches a critically narrow horizon must carry that
-    // debt into the final comparison.  This is deliberately dormant while
-    // mobility is comfortable, so it does not turn the search into a generic
-    // "maximize empty space" policy.
-    const double pathSurvivalPenalty = pathSurvivalCorrection(n);
-
-    // When the actual visible pair has no way to start a chain, do not let an
-    // arbitrary-pair virtual probe masquerade as real firing power.  The
-    // penalty is strongest in the danger zone and is intentionally small on
-    // healthy boards.
-    double trueTriggerAdjustment = 0.0;
-    if (n.trueTriggerMoves == 0 && n.trueImmediateChains == 0) {
-        if (n.worstFutureSafeMoves <= 3 || n.worstNext2SafeMoves <= 1)
-            trueTriggerAdjustment -= 14000.0;
-        else if (n.worstFutureSafeMoves <= 5)
-            trueTriggerAdjustment -= 3500.0;
-    }
-    if (n.trueTriggerPath >= 3) trueTriggerAdjustment += 9000.0;
-    else if (n.trueTriggerPath >= 2) trueTriggerAdjustment += 3500.0;
-
     return n.score + static_cast<double>(n.maxChain) * 25000.0
          + n.virtualPotential
          + gatedConstruction
          + viability * (constructionGate < 0.65 ? 0.72 : 0.22)
-         + survival
-         + pathSurvivalPenalty
-         + trueTriggerAdjustment;
+         + survival;
 }
 
 bool betterFinal(const Node& a, const Node& b) {
@@ -817,17 +762,16 @@ Move chooseRoot(
         return {-1, 0, false};
     }
 
-    // Final safety rescue: do not let a near-immediate mobility collapse win
-    // a close final comparison. This is intentionally applied only after the
-    // normal chain/structure ranking, so survival cannot globally turn the AI
-    // into a safe-but-short builder.
+    // Final safety rescue: normal chain/structure ranking remains untouched.
+    // First, allow the existing equal-max-chain escape in the true collapse
+    // zone. Then, and only then, allow a narrowly constrained stale-route
+    // escape: a root with very low future mobility, a high theoretical trigger
+    // route, but no realizable path using the actually visible next pairs.
     const Node* selected = &(*best);
+    bool emergencyEscapeApplied = false;
     if (best->hasRootSurvival && best->rootFutureSafeMoves <= 1) {
         for (const auto& node : beam) {
             if (!node.root.valid || !node.hasRootSurvival || node.rootFutureSafeMoves < 2) continue;
-
-            // Prefer an equal-max-chain escape first. This is the normal
-            // rescue and never trades away chain potential.
             if (node.maxChain >= best->maxChain &&
                 node.rootFutureSafeMoves > selected->rootFutureSafeMoves) {
                 const bool strongEscape =
@@ -837,32 +781,42 @@ Move chooseRoot(
                 if (strongEscape) selected = &node;
             }
         }
+    }
 
-        // Emergency-only second pass: when the chosen branch is about to
-        // lose all future mobility, a one-chain reduction is preferable to
-        // dying. Require a genuinely high board and a large mobility gain so
-        // this cannot affect ordinary construction or healthy long-chain
-        // turns. The candidate must keep at least (best-1) max-chain potential.
-        const auto selectedHeights = selected->board.heights();
-        const int selectedMaxHeight = *std::max_element(
-            selectedHeights.begin(), selectedHeights.end());
-        const bool emergencyHeight = selectedMaxHeight >= 12 || selectedHeights[2] >= 10;
-        if (emergencyHeight && selected->rootFutureSafeMoves <= 1) {
-            const Node* emergencyEscape = selected;
-            for (const auto& node : beam) {
-                if (!node.root.valid || !node.hasRootSurvival ||
-                    node.rootFutureSafeMoves < 4) continue;
-                if (node.maxChain + 1 < best->maxChain) continue;
-                if (node.maxChain + 1 < selected->maxChain) continue;
+    const bool staleRouteEmergency =
+        best->hasRootSurvival &&
+        best->rootFutureSafeMoves <= 4 &&
+        best->rootTrueTriggerPath <= 1 &&
+        best->rootTriggerRoute >= 7 &&
+        (best->rootMaxHeight >= 10 || best->rootDangerHeight >= 9);
 
-                if (emergencyEscape == selected ||
-                    node.rootFutureSafeMoves > emergencyEscape->rootFutureSafeMoves ||
-                    (node.rootFutureSafeMoves == emergencyEscape->rootFutureSafeMoves &&
-                     node.maxChain > emergencyEscape->maxChain)) {
-                    emergencyEscape = &node;
-                }
+    if (staleRouteEmergency) {
+        const Node* escape = nullptr;
+        for (const auto& node : beam) {
+            if (!node.root.valid || !node.hasRootSurvival) continue;
+            if (node.rootFutureSafeMoves < 6) continue;
+            if (node.maxChain + 1 < best->maxChain) continue;
+
+            // The escape itself must remain a construction candidate. A
+            // merely safer branch with no structural route is not allowed to
+            // replace a long-chain branch, because that recreates the old
+            // safe-but-short failure mode.
+            const bool routeCompatible =
+                (node.rootTriggerRoute >= 5 &&
+                 node.rootTriggerRoute + 2 >= best->rootTriggerRoute) ||
+                (node.rootTrueTriggerPath >= 2);
+            if (!routeCompatible) continue;
+
+            if (!escape ||
+                node.rootFutureSafeMoves > escape->rootFutureSafeMoves ||
+                (node.rootFutureSafeMoves == escape->rootFutureSafeMoves &&
+                 node.maxChain > escape->maxChain)) {
+                escape = &node;
             }
-            selected = emergencyEscape;
+        }
+        if (escape) {
+            selected = escape;
+            emergencyEscapeApplied = true;
         }
     }
 
@@ -880,6 +834,10 @@ Move chooseRoot(
             << " prematureRisk=" << selected->prematureRisk
             << " viability=" << selected->triggerViabilityScore
             << " vPath=" << selected->triggerViability.bestPath
+            << " rootSafe=" << selected->rootFutureSafeMoves
+            << " rootTruePath=" << selected->rootTrueTriggerPath
+            << " rootRoute=" << selected->rootTriggerRoute
+            << " emergencyEscape=" << (emergencyEscapeApplied ? 1 : 0)
             << " mainRoute=";
         for (std::size_t i = 0; i < selected->mainChain.colors.size(); ++i) {
             if (i) oss << "->";
@@ -904,10 +862,6 @@ Move BeamSearch::chooseMove(
     int beamWidth,
     const GameHistory& history
 ) const {
-    // GameHistory remains owned by AI for cross-turn observation and the final
-    // safety guard. This high-chain search intentionally uses only branch-local
-    // survival probes so the historical mode does not distort normal chain
-    // construction.
     (void)history;
     return chooseRoot(board, pieces, weights,
                       std::clamp(depth, 1, 50),
