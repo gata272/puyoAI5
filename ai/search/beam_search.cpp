@@ -25,14 +25,15 @@ namespace puyo {
 namespace {
 
 // This is a true beam search: every depth expands the current global beam and
-// then prunes back to `beamWidth`.  The previous implementation recursively
-// expanded a beam independently from every node, which grew roughly as
-// width^depth and became impractical once the lookahead was extended.
+// then prunes back to `beamWidth`. The beam deliberately keeps root-action
+// identity alive all the way through the search so that one attractive first
+// move cannot erase every alternative before terminal scoring.
 struct Node {
     Board board;
     Move root;
     double score = 0.0;
     int maxChain = 0;
+    int lastChain = 0;
     int triggerRoute = 0;
     double longPotential = 0.0;
     double structure = 0.0;
@@ -58,14 +59,17 @@ struct Node {
     double survivalScore = 0.0;
     bool hasSurvival = false;
 
-    // Root-action diagnostics used only by the emergency selector. These are
-    // deliberately not part of the ordinary beam/final utility.
+    // Root-action diagnostics are only used for diagnostics and the genuinely
+    // critical escape rule. The explicit probe flags are important: zero is a
+    // valid measured result, but it must not also mean "not probed".
     int rootTrueTriggerPath = 0;
     int rootTrueImmediateChains = 0;
     int rootTrueFollowupChains = 0;
     int rootTriggerRoute = 0;
     int rootMaxHeight = 0;
     int rootDangerHeight = 0;
+    bool hasRootTrueProbe = false;
+    bool hasRootRouteProbe = false;
     bool historicalStale = false;
 
     bool gameOver = false;
@@ -74,17 +78,12 @@ struct Node {
     bool hasFeatures = false;
 };
 
-constexpr double kDiscount = 0.85;
-constexpr double kChainReward = 15000.0;
 constexpr double kDeathPenalty = 250000.0;
 
-// Immediate chain reward is deliberately nonlinear.  It makes an actual
-// long chain dominate small scoring differences, while the static evaluator
-// remains responsible for constructing the chain before it fires.
+// Immediate chain reward is deliberately nonlinear. It makes an actual long
+// chain dominate small scoring differences, while the static evaluator remains
+// responsible for constructing the chain before it fires.
 double chainReward(int chains) {
-    // A smooth threshold curve keeps 7-9 from becoming the default cash-out,
-    // while leaving enough score headroom for the latent virtual-fire signal
-    // to influence construction before the real chain occurs.
     static constexpr double rewards[] = {
         0.0,      // 0
         -18000.0, // 1
@@ -108,6 +107,48 @@ double chainReward(int chains) {
     const double c = static_cast<double>(chains);
     return rewards[15] + (c - 15.0) * 400000.0 +
            std::max(0.0, c - 15.0) * std::max(0.0, c - 15.0) * 15000.0;
+}
+
+// Contextual anti-cashout rule inspired by the stronger v10-v13 style search
+// profile. A 7-9 chain is not inherently bad: when the pre-fire board is tall
+// or dangerous it can be exactly the recovery fire we need. Penalize it only
+// when the board before the fire is still comfortable AND visibly contains
+// enough chain-building material to justify waiting.
+double contextualCashoutPenalty(const Node& parent, int chains) {
+    if (chains < 7 || chains > 9 || !parent.hasFeatures) return 0.0;
+
+    const auto heights = parent.board.heights();
+    const int maxHeight = *std::max_element(heights.begin(), heights.end());
+    // The game-over column is x=2 in this simulator. Stay conservative here:
+    // once that column or any column is already entering the danger zone, do
+    // not discourage the fire that may be needed to survive.
+    if (heights[2] >= 9 || maxHeight > 10) return 0.0;
+
+    const Features& f = parent.features;
+    const double latent =
+        f.chainUnit4 * 6.0 +
+        f.chainUnit5 * 3.0 +
+        f.handoffPotential * 1.25 +
+        f.futureChainSpace * 0.55 +
+        f.tailSpace * 0.35 +
+        f.buildSpace * 0.18;
+
+    const bool strongPreparation =
+        latent >= 28.0 ||
+        f.chainUnit4 >= 2.0 ||
+        (f.chainUnit4 >= 1.0 &&
+         f.chainUnit5 >= 1.0 &&
+         f.futureChainSpace >= 8.0);
+    if (!strongPreparation) return 0.0;
+
+    const double strength = std::clamp((latent - 28.0) / 26.0, 0.0, 1.0);
+    static constexpr double base[] = {
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        28000.0, // 7
+        50000.0, // 8
+        78000.0  // 9
+    };
+    return base[chains] * (0.55 + 0.45 * strength);
 }
 
 std::uint64_t fastBoardHash(const Board& b) {
@@ -143,9 +184,6 @@ std::vector<Node> expandNode(
         EvaluationContext ctx;
         // The trigger planner is deliberately limited to the same three
         // visible pairs a human-style policy is allowed to use.
-        // `remainingPieces` starts at the current depth.  The current pair has
-        // already been placed, so evaluation must see the *next* visible
-        // pieces, not the pair that was just consumed.
         const std::size_t lookStart = 1;
         const std::size_t lookEnd = std::min(
             remainingPieces.size(), lookStart + static_cast<std::size_t>(3));
@@ -154,15 +192,16 @@ std::vector<Node> expandNode(
                 remainingPieces.begin() + static_cast<std::ptrdiff_t>(lookStart),
                 remainingPieces.begin() + static_cast<std::ptrdiff_t>(lookEnd));
         }
-        // Only terminal candidates pay the expensive ama-style quiet search.
         ctx.quiescenceDepth = (nextDepth >= maxDepth) ? 3 : 0;
 
         const Features childFeatures = extractStaticFeatures(sim.board);
+        const double cashoutPenalty = contextualCashoutPenalty(parent, sim.chains);
         double local = evaluate(sim.board, weights, ctx, &childFeatures)
                      + actionPenalty(parent.board, sim, move, weights,
                                      parent.hasFeatures ? &parent.features : nullptr,
                                      &childFeatures)
-                     + chainReward(sim.chains);
+                     + chainReward(sim.chains)
+                     - cashoutPenalty;
 
         if (deathMove) local -= kDeathPenalty;
 
@@ -173,10 +212,7 @@ std::vector<Node> expandNode(
         candidate.boardHash = fastBoardHash(candidate.board);
         candidate.root = parent.root.valid ? parent.root : move;
         candidate.maxChain = std::max(parent.maxChain, sim.chains);
-        // Route/main-chain analysis is intentionally deferred to the terminal
-        // beam. Those routines perform hypothetical chain resolutions and are
-        // too expensive to run for every child. The fast static evaluator and
-        // real chain reward remain on the hot path.
+        candidate.lastChain = sim.chains;
         candidate.triggerRoute = parent.triggerRoute;
         candidate.longPotential = 0.0;
         candidate.mainChainScore = 0.0;
@@ -200,6 +236,8 @@ std::vector<Node> expandNode(
         candidate.rootTriggerRoute = parent.rootTriggerRoute;
         candidate.rootMaxHeight = parent.rootMaxHeight;
         candidate.rootDangerHeight = parent.rootDangerHeight;
+        candidate.hasRootTrueProbe = parent.hasRootTrueProbe;
+        candidate.hasRootRouteProbe = parent.hasRootRouteProbe;
         candidate.historicalStale = parent.historicalStale;
         candidate.gameOver = deathMove;
 
@@ -208,19 +246,15 @@ std::vector<Node> expandNode(
     }
 
     // Critical fallback rule: death placements are ignored whenever at least
-    // one safe placement exists. If none exists, return the least-bad death
-    // candidates so the AI can still place the current pair and let the game
-    // end naturally instead of producing an invalid/no-op move.
+    // one safe placement exists. If none exists, return the death candidates
+    // so the AI can still place the current pair and let the game end naturally
+    // instead of producing an invalid/no-op move.
     if (!safe.empty()) return safe;
     return death;
 }
 
 double survivalCorrection(const Node& n) {
     if (!n.hasSurvival) return 0.0;
-    // Protect prepared long-chain material from being traded away for a small
-    // amount of extra mobility. Survival becomes decisive only in the actual
-    // collapse zone; a board with strong exact-3/4-unit preparation is allowed
-    // to take a calculated risk.
     const double asset = std::clamp(
         n.features.chainUnit4 + 0.5 * n.features.chainUnit5 +
         0.35 * n.features.handoffPotential,
@@ -248,10 +282,17 @@ bool betterForBeam(const Node& a, const Node& b) {
     const double ua = beamUtility(a);
     const double ub = beamUtility(b);
     if (ua != ub) return ua > ub;
-    return a.maxChain > b.maxChain;
+    if (a.maxChain != b.maxChain) return a.maxChain > b.maxChain;
+    return a.lastChain > b.lastChain;
 }
 
+bool sameRootAction(const Move& a, const Move& b) {
+    return a.valid == b.valid && a.x == b.x && a.rotation == b.rotation;
+}
 
+// Preserve root identities before filling the beam by utility. This is the
+// key structural change: diversity is enforced while the frontier is alive,
+// rather than trying to recover discarded roots at the very end.
 void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
     if (static_cast<int>(candidates.size()) <= beamWidth) return;
 
@@ -259,10 +300,26 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
     std::vector<Node> selected;
     selected.reserve(static_cast<std::size_t>(beamWidth));
 
-    // First reserve a small number of genuinely safer states when the
-    // frontier is entering the danger zone.  This is deliberately bounded:
-    // chain-building states still occupy most of the beam, but one heuristic
-    // mistake cannot erase every escape route at once.
+    // A small root Pareto reserve. Six roots is enough for the standard
+    // 6-column move geometry and leaves half of the active width for the
+    // strongest continuation states when the active beam is 12.
+    const int rootReserve = std::min(6, beamWidth);
+    bool seenRoot[BOARD_WIDTH][4]{};
+    for (const auto& node : candidates) {
+        if (static_cast<int>(selected.size()) >= rootReserve) break;
+        if (!node.root.valid || node.root.x < 0 || node.root.x >= BOARD_WIDTH ||
+            node.root.rotation < 0 || node.root.rotation >= 4) {
+            continue;
+        }
+        if (seenRoot[node.root.x][node.root.rotation]) continue;
+        seenRoot[node.root.x][node.root.rotation] = true;
+        selected.push_back(node);
+    }
+
+    // In the genuine danger zone, add a tiny survival reserve after root
+    // diversity has already been secured. Survival therefore cannot erase the
+    // long-chain root set, and safety is not allowed to become a broad scalar
+    // reward across the ordinary search.
     bool dangerPresent = false;
     for (const auto& node : candidates) {
         const auto h = node.board.heights();
@@ -288,110 +345,36 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
             return a->score > b->score;
         });
 
-        // At most a quarter of the beam is a survival reserve.  Prefer
-        // chain-preserving survivors when the safety values are equal.
-        const int reserve = std::min(
-            std::max(1, beamWidth / 4), beamWidth);
+        const int reserve = std::min(std::max(1, beamWidth / 6), beamWidth);
         for (const Node* node : safety) {
-            if (static_cast<int>(selected.size()) >= reserve) break;
-            bool duplicate = false;
+            if (static_cast<int>(selected.size()) >= rootReserve + reserve) break;
+            bool duplicateBoard = false;
             for (const auto& existing : selected) {
-                if (existing.boardHash == node->boardHash) {
-                    duplicate = true;
+                if (existing.boardHash == node->boardHash &&
+                    sameRootAction(existing.root, node->root)) {
+                    duplicateBoard = true;
                     break;
                 }
             }
-            if (!duplicate) selected.push_back(*node);
+            if (!duplicateBoard) selected.push_back(*node);
         }
     }
 
-    // Root Rescue Reserve -------------------------------------------------
-    //
-    // If the committed root action has become stale across turns (or the
-    // current root diagnostics already look stale), do not let every safer
-    // alternative disappear during deeper beam pruning.  This is a RESERVE,
-    // not a ranking change: ordinary long-chain utility still decides the
-    // final move unless the actual emergency selector later needs the rescue.
-    // Keeping only one or two roots is intentional; broad survival weighting
-    // was shown to destroy the high-chain behavior in earlier versions.
-    if (dangerPresent) {
-        const Node* bestRoot = candidates.empty() ? nullptr : &candidates.front();
-        bool staleRootPresent = false;
-        if (bestRoot && bestRoot->root.valid && bestRoot->hasRootSurvival) {
-            staleRootPresent =
-                bestRoot->rootFutureSafeMoves >= 0 &&
-                bestRoot->rootFutureSafeMoves <= 4 &&
-                bestRoot->rootTrueTriggerPath <= 1 &&
-                (bestRoot->historicalStale || bestRoot->rootTriggerRoute >= 7);
-        }
-
-        if (staleRootPresent) {
-            const int bestChain = bestRoot->maxChain;
-            const double bestScore = bestRoot->score;
-            std::vector<const Node*> rescue;
-            rescue.reserve(candidates.size());
-            for (const auto& node : candidates) {
-                if (!node.root.valid || !node.hasRootSurvival) continue;
-                if (node.rootFutureSafeMoves < 6) continue;
-                const bool chainCompatible = node.maxChain + 2 >= bestChain;
-                const bool scoreCompatible = node.score >= bestScore - 100000.0;
-                if (!chainCompatible && !scoreCompatible) continue;
-                rescue.push_back(&node);
-            }
-
-            std::sort(rescue.begin(), rescue.end(), [](const Node* a, const Node* b) {
-                if (a->rootFutureSafeMoves != b->rootFutureSafeMoves)
-                    return a->rootFutureSafeMoves > b->rootFutureSafeMoves;
-                if (a->maxChain != b->maxChain)
-                    return a->maxChain > b->maxChain;
-                return a->score > b->score;
-            });
-
-            const int rescueSlots = std::min(2, std::max(1, beamWidth / 6));
-            for (const Node* node : rescue) {
-                if (static_cast<int>(selected.size()) >= beamWidth) break;
-                if (static_cast<int>(selected.size()) >= rescueSlots +
-                    std::min(std::max(1, beamWidth / 4), beamWidth)) break;
-                bool duplicateRoot = false;
-                for (const auto& existing : selected) {
-                    if (existing.root.x == node->root.x &&
-                        existing.root.rotation == node->root.rotation) {
-                        duplicateRoot = true;
-                        break;
-                    }
-                }
-                if (!duplicateRoot) selected.push_back(*node);
-            }
-        }
-    }
-
-    // Keep a small root-action diversity reserve. This prevents one attractive
-    // first move from occupying the entire beam before virtual-fire refinement.
-    const int diversitySlots = std::min(6, beamWidth);
-    bool seenRoot[BOARD_WIDTH][4]{};
-    for (const auto& node : candidates) {
-        if (static_cast<int>(selected.size()) >= diversitySlots) break;
-        if (node.root.valid && node.root.x >= 0 && node.root.x < BOARD_WIDTH &&
-            node.root.rotation >= 0 && node.root.rotation < 4 &&
-            !seenRoot[node.root.x][node.root.rotation]) {
-            seenRoot[node.root.x][node.root.rotation] = true;
-            selected.push_back(node);
-        }
-    }
+    // Fill by the ordinary beam utility. All root diversity decisions above
+    // are pure reserves: they do not permanently boost weak nodes.
     for (const auto& node : candidates) {
         if (static_cast<int>(selected.size()) >= beamWidth) break;
         bool duplicate = false;
         for (const auto& existing : selected) {
-            if (existing.root.x == node.root.x &&
-                existing.root.rotation == node.root.rotation &&
-                existing.score == node.score &&
-                existing.maxChain == node.maxChain) {
+            if (existing.boardHash == node.boardHash &&
+                sameRootAction(existing.root, node.root)) {
                 duplicate = true;
                 break;
             }
         }
         if (!duplicate) selected.push_back(node);
     }
+
     candidates.swap(selected);
 }
 
@@ -426,28 +409,16 @@ void applySurvivalProbe(
     int probeLimit,
     std::unordered_map<SurvivalCacheKey, SurvivalHorizon, SurvivalCacheKeyHash>& cache
 ) {
-    // At depth d, candidates have consumed pieces[d].  Probe only the next
-    // visible pair (and its following geometric mobility) so this remains a
-    // human-information horizon rather than hidden-future search.
     if (candidates.empty() || probeLimit <= 0 || depth >= static_cast<int>(pieces.size())) return;
     const PuyoPair* next = &pieces[static_cast<std::size_t>(depth)];
     const PuyoPair* nextNext = (depth + 1 < static_cast<int>(pieces.size()))
         ? &pieces[static_cast<std::size_t>(depth + 1)] : nullptr;
 
-    // Probe the first candidates in their existing deterministic expansion
-    // order. Do not sort here: an extra sort of equal-score nodes can change
-    // transposition representatives and unintentionally change the AI even
-    // when the survival signal is not used for ranking.
     const int n = std::min(probeLimit, static_cast<int>(candidates.size()));
     for (int i = 0; i < n; ++i) {
         Node& node = candidates[static_cast<std::size_t>(i)];
         const auto heights = node.board.heights();
         const int maxHeight = *std::max_element(heights.begin(), heights.end());
-        // Start measuring before the literal game-over line.  The dangerous
-        // column is column 2, but a tall neighboring stack can make the next
-        // horizontal/rotated pair collapse into it.  We therefore begin the
-        // probe in the transition zone and let the score remain neutral while
-        // mobility is still comfortable.
         if (heights[2] < 8 && maxHeight < 10) continue;
         const int previousSafeMoves = node.previousFutureSafeMoves;
         const int previousGeometricMoves = node.previousFutureGeometricMoves;
@@ -473,14 +444,7 @@ void applySurvivalProbe(
         node.bestNextSafeMoves = h.bestNextSafeMoves;
         node.survivalScore = survivalHorizonScore(h, previousSafeMoves, previousGeometricMoves);
 
-        // The exact visible-piece path is collected only for root actions in
-        // the danger/transition zone. It is an emergency diagnostic, never a
-        // normal construction score. The richer survival_horizon probe uses
-        // only the currently visible next two pairs.
         if (depth == 1) {
-            // Root geometry is cheap and must remain available even when the
-            // detailed true-trigger probe is skipped. It is used only for the
-            // narrowly-scoped stale/emergency detector.
             node.rootMaxHeight = maxHeight;
             node.rootDangerHeight = heights[2];
             const bool emergencyProbe =
@@ -491,15 +455,12 @@ void applySurvivalProbe(
                 node.rootTrueTriggerPath = h.trueTriggerPath;
                 node.rootTrueImmediateChains = h.trueImmediateChains;
                 node.rootTrueFollowupChains = h.trueFollowupChains;
-                node.rootMaxHeight = maxHeight;
-                node.rootDangerHeight = heights[2];
+                node.hasRootTrueProbe = true;
                 node.rootTriggerRoute = triggerRouteLength(node.board);
+                node.hasRootRouteProbe = true;
             }
         }
 
-        // Keep the root-level mobility measurement attached to the root action
-        // all the way to the final beam. It can then be used for a final safety
-        // rescue without changing the intermediate construction search.
         if (depth == 1) {
             node.rootFutureSafeMoves = h.safeMoves;
             node.rootSurvivalScore = node.survivalScore;
@@ -523,7 +484,6 @@ void applyVirtualRerank(std::vector<Node>& beam, int topM) {
         }
     }
 }
-
 
 std::string debugBoard(const Board& board) {
     std::string out;
@@ -564,6 +524,7 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " utility=" << finalUtility(x)
             << " score=" << x.score
             << " maxChain=" << x.maxChain
+            << " lastChain=" << x.lastChain
             << " route=" << x.triggerRoute
             << " longPotential=" << x.longPotential
             << " virtual=" << x.virtualPotential
@@ -581,7 +542,9 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " rootTruePath=" << x.rootTrueTriggerPath
             << " rootTrueNow=" << x.rootTrueImmediateChains
             << " rootTrueFollow=" << x.rootTrueFollowupChains
+            << " rootTrueProbe=" << (x.hasRootTrueProbe ? 1 : 0)
             << " rootRoute=" << x.rootTriggerRoute
+            << " rootRouteProbe=" << (x.hasRootRouteProbe ? 1 : 0)
             << " rootSafe=" << x.rootFutureSafeMoves
             << " structure=" << x.structure
             << " mainChain=" << x.mainChain.length()
@@ -592,11 +555,6 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
 }
 
 double finalUtility(const Node& n) {
-    // Virtual potential is a test of whether the current construction still
-    // has an actual route to a chain.  Route/structure/construction scores are
-    // useful only while that viability is intact. Without this gate, the AI
-    // can keep rewarding a visually convincing "long-chain shape" after its
-    // firing path has already disappeared.
     const double survival = survivalCorrection(n);
 
     double constructionGate = 1.0;
@@ -607,9 +565,6 @@ double finalUtility(const Node& n) {
         else if (n.virtualPotential < 60000.0) constructionGate = 0.84;
     }
 
-    // When virtual firepower is weak, a real trigger-transfer path is the
-    // preferred recovery signal. It prevents "safe but short" construction
-    // from winning merely because it has a pleasant static shape.
     const double viability = n.hasTriggerViability
         ? n.triggerViabilityScore
         : 0.0;
@@ -635,6 +590,26 @@ bool betterFinal(const Node& a, const Node& b) {
     return a.maxChain > b.maxChain;
 }
 
+struct RootBoardKey {
+    std::uint64_t board = 0;
+    std::uint8_t x = 0;
+    std::uint8_t rotation = 0;
+    bool operator==(const RootBoardKey& other) const {
+        return board == other.board && x == other.x && rotation == other.rotation;
+    }
+};
+
+struct RootBoardKeyHash {
+    std::size_t operator()(const RootBoardKey& key) const {
+        std::uint64_t x = key.board;
+        x ^= static_cast<std::uint64_t>(key.x + 1) * 0x9e3779b97f4a7c15ULL;
+        x ^= static_cast<std::uint64_t>(key.rotation + 1) * 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        return static_cast<std::size_t>(x ^ (x >> 31));
+    }
+};
 
 Move chooseRoot(
     const Board& board,
@@ -651,16 +626,11 @@ Move chooseRoot(
         static_cast<int>(pieces.size())
     );
 
-    // Very wide beams amplify small heuristic errors on this lightweight
-    // evaluator. Keep the user-configured beam value intact for the API, but
-    // cap the active construction frontier at 12; this is close to the
-    // high-performing v13-style search budget and prevents beam=24/48 from
-    // spending most of its work on correlated low-quality states.
+    // Keep the established v18/v6 active frontier cap. The improvement comes
+    // from preserving alternatives, not from multiplying compute cost.
     const int activeBeamWidth = std::min(beamWidth, 12);
     if (horizon <= 0) return {-1, 0, false};
 
-    // The root is expanded exactly once, then the same beam is propagated
-    // globally through subsequent pieces.
     Node root;
     root.board = board;
     root.boardHash = fastBoardHash(root.board);
@@ -678,8 +648,6 @@ Move chooseRoot(
 
     for (int depth = 0; depth < horizon; ++depth) {
         std::vector<Node> next;
-        // At most beamWidth * 24 legal placements on a standard 6-column
-        // board. Reserve generously without allocating per child later.
         next.reserve(static_cast<std::size_t>(activeBeamWidth) * 24U);
 
         for (const Node& node : beam) {
@@ -690,23 +658,13 @@ Move chooseRoot(
                                    pieces.begin() + static_cast<std::ptrdiff_t>(end));
             auto children = expandNode(
                 node, pieces[depth], remainingPieces, weights, depth + 1, horizon);
-            for (auto& child : children) {
-                next.push_back(std::move(child));
-            }
+            for (auto& child : children) next.push_back(std::move(child));
         }
 
         if (next.empty()) return {-1, 0, false};
 
-        // Root-layer refinement is especially important: without it a good
-        // first move can be discarded before the virtual-fire signal ever
-        // sees the board. Probe a moderate prefix here; deeper layers use a
-        // smaller top-M budget.
         if (depth == 0) {
             applyVirtualRerank(next, std::min(12, activeBeamWidth));
-            // The first move is too important to sample only the top-scoring
-            // half of the legal placements.  Probe every root child so a
-            // survival-safe chain-preserving move cannot disappear before the
-            // final root comparison.
             applySurvivalProbe(next, pieces, depth + 1,
                                static_cast<int>(next.size()), survivalCache);
             std::sort(next.begin(), next.end(), [](const Node& a, const Node& b) {
@@ -714,17 +672,20 @@ Move chooseRoot(
             });
         }
 
-        // Transposition reduction: different move orders can converge to the
-        // same board at a given depth. Keep the best-scoring representative.
-        // The current depth uses the same future queue for every node, so the
-        // board itself is a sufficient state key here. This both removes
-        // duplicate work and preserves the strongest root decision.
-        std::unordered_map<std::uint64_t, std::size_t> transpositions;
+        // Root-aware transposition reduction. At this point board hash alone is
+        // no longer a sufficient search-state identity: two different root
+        // actions can reach the same board and still represent different first
+        // moves. Keep the strongest representative *per root action*.
+        std::unordered_map<RootBoardKey, std::size_t, RootBoardKeyHash> transpositions;
         transpositions.reserve(next.size());
         std::vector<Node> uniqueNext;
         uniqueNext.reserve(next.size());
         for (auto& candidate : next) {
-            const auto key = candidate.boardHash;
+            const RootBoardKey key{
+                candidate.boardHash,
+                static_cast<std::uint8_t>(std::clamp(candidate.root.x, 0, 255)),
+                static_cast<std::uint8_t>(std::clamp(candidate.root.rotation, 0, 255))
+            };
             const auto it = transpositions.find(key);
             if (it == transpositions.end()) {
                 transpositions.emplace(key, uniqueNext.size());
@@ -748,10 +709,6 @@ Move chooseRoot(
                     break;
                 }
             }
-            // In the danger zone, evaluate the whole frontier before pruning.
-            // This is a multi-objective beam: chain construction keeps its
-            // normal score, while survival gets a chance to reserve an escape
-            // route.  On low boards we retain the old cheap top-M probe.
             const int probeLimit = dangerPresent
                 ? static_cast<int>(next.size())
                 : std::min(12, activeBeamWidth);
@@ -762,22 +719,18 @@ Move chooseRoot(
 
         beam.swap(next);
 
-        // v13-style mid-search refinement: expensive virtual-fire probes are
-        // applied only to the strongest few states, not to every expanded
-        // child. At depth 2+ this recovers much of the information value of a
-        // full virtual evaluator while keeping the normal beam practical.
         if (depth + 1 >= 2) {
             applyVirtualRerank(beam, std::min(8, activeBeamWidth));
             std::sort(beam.begin(), beam.end(), [](const Node& a, const Node& b) {
                 return finalUtility(a) > finalUtility(b);
             });
-            if (static_cast<int>(beam.size()) > activeBeamWidth) beam.resize(static_cast<std::size_t>(activeBeamWidth));
+            if (static_cast<int>(beam.size()) > activeBeamWidth) {
+                beam.resize(static_cast<std::size_t>(activeBeamWidth));
+            }
         }
 
         debugBeamSummary(beam, depth + 1, activeBeamWidth);
 
-        // Once every surviving branch is a game-over placement, there is no
-        // future piece to search. Keep the best one and finish.
         bool allDead = true;
         for (const auto& node : beam) {
             if (!node.gameOver) {
@@ -788,9 +741,6 @@ Move chooseRoot(
         if (allDead) break;
     }
 
-    // Final refinement: evaluate the whole surviving beam with the expensive
-    // virtual-fire probe, then apply the user's sequential trigger-transfer
-    // analysis only to the strongest virtual candidates.
     applyVirtualRerank(beam, std::min(18, static_cast<int>(beam.size())));
     if (horizon < static_cast<int>(pieces.size())) {
         applySurvivalProbe(beam, pieces, horizon, static_cast<int>(beam.size()), survivalCache);
@@ -798,9 +748,26 @@ Move chooseRoot(
     std::sort(beam.begin(), beam.end(), [](const Node& a, const Node& b) {
         return finalUtility(a) > finalUtility(b);
     });
-    const int structuralM = std::min(6, static_cast<int>(beam.size()));
-    for (int i = 0; i < structuralM; ++i) {
-        Node& node = beam[static_cast<std::size_t>(i)];
+
+    // Evaluate one structurally best candidate per root first. This keeps the
+    // final expensive stage root-diverse too, instead of preserving diversity
+    // in the early beam and then collapsing it again at terminal scoring.
+    std::vector<int> structuralIndices;
+    structuralIndices.reserve(8);
+    bool seenRoot[BOARD_WIDTH][4]{};
+    const int structuralLimit = std::min(8, static_cast<int>(beam.size()));
+    for (int i = 0; i < static_cast<int>(beam.size()) &&
+                    static_cast<int>(structuralIndices.size()) < structuralLimit; ++i) {
+        const Node& node = beam[static_cast<std::size_t>(i)];
+        if (!node.root.valid || node.root.x < 0 || node.root.x >= BOARD_WIDTH ||
+            node.root.rotation < 0 || node.root.rotation >= 4) continue;
+        if (seenRoot[node.root.x][node.root.rotation]) continue;
+        seenRoot[node.root.x][node.root.rotation] = true;
+        structuralIndices.push_back(i);
+    }
+
+    for (const int index : structuralIndices) {
+        Node& node = beam[static_cast<std::size_t>(index)];
         node.triggerRoute = triggerRouteLength(node.board);
         node.longPotential = longChainPotential(node.board, {});
         node.mainChain = analyzeMainChain(node.board);
@@ -811,12 +778,8 @@ Move chooseRoot(
         node.mainChainScore = mainChainConstructionScore(node.board, node.mainChain) * 0.05;
     }
 
-    // Trigger viability is a final tie-break/recovery signal. Evaluate the
-    // same small structural frontier that already pays the expensive route
-    // analysis; do not run hypothetical chain resolution for every terminal
-    // beam node.
-    for (int i = 0; i < structuralM; ++i) {
-        Node& node = beam[static_cast<std::size_t>(i)];
+    for (const int index : structuralIndices) {
+        Node& node = beam[static_cast<std::size_t>(index)];
         node.triggerViability = analyzeTriggerViability(node.board, node.triggerRoute);
         node.triggerViabilityScore = triggerViabilityScore(node.triggerViability);
         node.hasTriggerViability = true;
@@ -834,99 +797,37 @@ Move chooseRoot(
         return {-1, 0, false};
     }
 
-    // Final safety rescue: normal chain/structure ranking remains untouched.
-    // First, allow the existing equal-max-chain escape in the true collapse
-    // zone. Then, and only then, allow a narrowly constrained stale-route
-    // escape: a root with very low future mobility, a high theoretical trigger
-    // route, but no realizable path using the actually visible next pairs.
+    // Safety intervention is intentionally tiny. Root diversity is now the
+    // normal safeguard. Only a genuinely critical 0-1 safe-move state may
+    // trigger a root escape, and the escape must preserve meaningful chain
+    // value. This removes the broad stale-route Rescue that previously caused
+    // several 12->9, 12->8 and 13->11 regressions.
     const Node* selected = &(*best);
-    bool rootRescueApplied = false;
-    bool emergencyEscapeApplied = false;
+    bool criticalEscapeApplied = false;
 
-    // Moderate root rescue: when the committed root has become narrow and the
-    // actual visible route is not progressing, prefer a much safer root only
-    // if it also preserves substantially more realized/available chain
-    // material. This is intentionally a final-candidate rule, not a general
-    // survival weight. It targets the observed failure where a safe,
-    // chain-preserving root survived in the beam but lost to a brittle
-    // theoretical route during terminal structural scoring.
     if (best->hasRootSurvival &&
-        best->rootFutureSafeMoves >= 0 && best->rootFutureSafeMoves <= 6 &&
-        best->rootTrueTriggerPath <= 1 &&
-        best->historicalStale) {
-        const double bestUtility = finalUtility(*best);
-        const Node* rescue = nullptr;
-        for (const auto& node : beam) {
-            if (!node.root.valid || !node.hasRootSurvival) continue;
-            if (node.rootFutureSafeMoves < best->rootFutureSafeMoves + 6) continue;
-            if (node.maxChain < best->maxChain + 2) continue;
-            if (finalUtility(node) + 260000.0 < bestUtility) continue;
-            if (!rescue ||
-                node.rootFutureSafeMoves > rescue->rootFutureSafeMoves ||
-                (node.rootFutureSafeMoves == rescue->rootFutureSafeMoves &&
-                 node.maxChain > rescue->maxChain) ||
-                (node.rootFutureSafeMoves == rescue->rootFutureSafeMoves &&
-                 node.maxChain == rescue->maxChain &&
-                 finalUtility(node) > finalUtility(*rescue))) {
-                rescue = &node;
-            }
-        }
-        if (rescue) {
-            selected = rescue;
-            rootRescueApplied = true;
-        }
-    }
-
-    if (best->hasRootSurvival && best->rootFutureSafeMoves <= 1) {
-        for (const auto& node : beam) {
-            if (!node.root.valid || !node.hasRootSurvival || node.rootFutureSafeMoves < 2) continue;
-            if (node.maxChain >= best->maxChain &&
-                node.rootFutureSafeMoves > selected->rootFutureSafeMoves) {
-                const bool strongEscape =
-                    node.rootFutureSafeMoves >= 4 ||
-                    (node.rootFutureSafeMoves >= 2 &&
-                     node.bestNextSafeMoves >= 2);
-                if (strongEscape) selected = &node;
-            }
-        }
-    }
-
-    const bool staleRouteEmergency =
-        best->hasRootSurvival &&
-        best->rootFutureSafeMoves <= 4 &&
-        best->rootTrueTriggerPath <= 1 &&
-        (best->historicalStale || best->rootTriggerRoute >= 7) &&
-        (best->rootMaxHeight >= 10 || best->rootDangerHeight >= 9);
-
-    if (staleRouteEmergency) {
+        best->rootFutureSafeMoves >= 0 && best->rootFutureSafeMoves <= 1) {
         const Node* escape = nullptr;
         for (const auto& node : beam) {
             if (!node.root.valid || !node.hasRootSurvival) continue;
-            if (node.rootFutureSafeMoves < 6) continue;
-            if (node.maxChain + 1 < best->maxChain) continue;
-
-            // The escape itself must remain a construction candidate. A
-            // merely safer branch with no structural route is not allowed to
-            // replace a long-chain branch, because that recreates the old
-            // safe-but-short failure mode.
-            const bool routeCompatible =
-                (node.rootTriggerRoute >= 5 &&
-                 node.rootTriggerRoute + 2 >= best->rootTriggerRoute) ||
-                (node.rootTrueTriggerPath >= 2) ||
-                (node.maxChain + 2 >= best->maxChain &&
-                 finalUtility(node) >= finalUtility(*best) - 120000.0);
-            if (!routeCompatible) continue;
+            if (node.rootFutureSafeMoves < 3) continue;
+            if (node.maxChain + 2 < best->maxChain) continue;
+            if (node.lastChain <= 0 && node.maxChain == 0 && node.score + 50000.0 < best->score)
+                continue;
 
             if (!escape ||
-                node.rootFutureSafeMoves > escape->rootFutureSafeMoves ||
-                (node.rootFutureSafeMoves == escape->rootFutureSafeMoves &&
-                 node.maxChain > escape->maxChain)) {
+                node.maxChain > escape->maxChain ||
+                (node.maxChain == escape->maxChain &&
+                 node.rootFutureSafeMoves > escape->rootFutureSafeMoves) ||
+                (node.maxChain == escape->maxChain &&
+                 node.rootFutureSafeMoves == escape->rootFutureSafeMoves &&
+                 finalUtility(node) > finalUtility(*escape))) {
                 escape = &node;
             }
         }
         if (escape) {
             selected = escape;
-            emergencyEscapeApplied = true;
+            criticalEscapeApplied = true;
         }
     }
 
@@ -936,6 +837,7 @@ Move chooseRoot(
             << ") utility=" << finalUtility(*selected)
             << " score=" << selected->score
             << " maxChain=" << selected->maxChain
+            << " lastChain=" << selected->lastChain
             << " route=" << selected->triggerRoute
             << " longPotential=" << selected->longPotential
             << " structure=" << selected->structure
@@ -946,10 +848,11 @@ Move chooseRoot(
             << " vPath=" << selected->triggerViability.bestPath
             << " rootSafe=" << selected->rootFutureSafeMoves
             << " rootTruePath=" << selected->rootTrueTriggerPath
+            << " rootTrueProbe=" << (selected->hasRootTrueProbe ? 1 : 0)
             << " rootRoute=" << selected->rootTriggerRoute
+            << " rootRouteProbe=" << (selected->hasRootRouteProbe ? 1 : 0)
             << " historicalStale=" << (selected->historicalStale ? 1 : 0)
-            << " rootRescue=" << (rootRescueApplied ? 1 : 0)
-            << " emergencyEscape=" << (emergencyEscapeApplied ? 1 : 0)
+            << " criticalEscape=" << (criticalEscapeApplied ? 1 : 0)
             << " mainRoute=";
         for (std::size_t i = 0; i < selected->mainChain.colors.size(); ++i) {
             if (i) oss << "->";
