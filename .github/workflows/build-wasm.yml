@@ -99,6 +99,21 @@ jobs:
 
           ./virtual_chain_potential_test
 
+      - name: Geometry policy regression test
+        run: |
+          g++ \
+            -std=c++20 \
+            -O2 \
+            tests/test_geometry_policy.cpp \
+            ai/evaluation/features.cpp \
+            ai/evaluation/forms.cpp \
+            ai/simulation/board.cpp \
+            ai/simulation/simulator.cpp \
+            -I. \
+            -o geometry_policy_test
+
+          ./geometry_policy_test
+
       - name: Main-chain policy regression test
         run: |
           g++ \
@@ -273,8 +288,6 @@ jobs:
             --exclude='main_chain_test' \
             --exclude='chain_benchmark_test' \
             --exclude='survival_horizon_test' \
-            --exclude='game_history_test' \
-            --exclude='benchmark_stream_test' \
             --exclude='puyoai_test' \
             --exclude='puyoai_construction_test' \
             --exclude='puyoai_virtual_test' \
