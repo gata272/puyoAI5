@@ -300,10 +300,11 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
     std::vector<Node> selected;
     selected.reserve(static_cast<std::size_t>(beamWidth));
 
-    // A small root Pareto reserve. Six roots is enough for the standard
-    // 6-column move geometry and leaves half of the active width for the
-    // strongest continuation states when the active beam is 12.
-    const int rootReserve = std::min(6, beamWidth);
+    // Keep a moderate root-action reserve. We intentionally do not preserve
+    // every legal root: with a 16-node active beam that would consume almost
+    // the whole frontier and recreate the over-diversification problem seen
+    // in the previous version. The remainder stays globally ranked by utility.
+    const int rootReserve = std::min(8, std::max(1, beamWidth / 2));
     bool seenRoot[BOARD_WIDTH][4]{};
     for (const auto& node : candidates) {
         if (static_cast<int>(selected.size()) >= rootReserve) break;
@@ -345,7 +346,7 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
             return a->score > b->score;
         });
 
-        const int reserve = std::min(std::max(1, beamWidth / 6), beamWidth);
+        const int reserve = std::min(2, std::max(0, beamWidth - rootReserve));
         for (const Node* node : safety) {
             if (static_cast<int>(selected.size()) >= rootReserve + reserve) break;
             bool duplicateBoard = false;
@@ -626,9 +627,10 @@ Move chooseRoot(
         static_cast<int>(pieces.size())
     );
 
-    // Keep the established v18/v6 active frontier cap. The improvement comes
-    // from preserving alternatives, not from multiplying compute cost.
-    const int activeBeamWidth = std::min(beamWidth, 12);
+    // Keep a bounded active frontier so the browser remains practical, but
+    // give the search more room than the previous 12-node cap. The extra
+    // capacity is used for strong continuations, not as a survival score.
+    const int activeBeamWidth = std::min(beamWidth, 16);
     if (horizon <= 0) return {-1, 0, false};
 
     Node root;
@@ -664,7 +666,7 @@ Move chooseRoot(
         if (next.empty()) return {-1, 0, false};
 
         if (depth == 0) {
-            applyVirtualRerank(next, std::min(12, activeBeamWidth));
+            applyVirtualRerank(next, std::min(14, activeBeamWidth));
             applySurvivalProbe(next, pieces, depth + 1,
                                static_cast<int>(next.size()), survivalCache);
             std::sort(next.begin(), next.end(), [](const Node& a, const Node& b) {
@@ -720,7 +722,7 @@ Move chooseRoot(
         beam.swap(next);
 
         if (depth + 1 >= 2) {
-            applyVirtualRerank(beam, std::min(8, activeBeamWidth));
+            applyVirtualRerank(beam, std::min(10, activeBeamWidth));
             std::sort(beam.begin(), beam.end(), [](const Node& a, const Node& b) {
                 return finalUtility(a) > finalUtility(b);
             });
@@ -741,7 +743,7 @@ Move chooseRoot(
         if (allDead) break;
     }
 
-    applyVirtualRerank(beam, std::min(18, static_cast<int>(beam.size())));
+    applyVirtualRerank(beam, std::min(16, static_cast<int>(beam.size())));
     if (horizon < static_cast<int>(pieces.size())) {
         applySurvivalProbe(beam, pieces, horizon, static_cast<int>(beam.size()), survivalCache);
     }
@@ -753,9 +755,9 @@ Move chooseRoot(
     // final expensive stage root-diverse too, instead of preserving diversity
     // in the early beam and then collapsing it again at terminal scoring.
     std::vector<int> structuralIndices;
-    structuralIndices.reserve(8);
+    structuralIndices.reserve(10);
     bool seenRoot[BOARD_WIDTH][4]{};
-    const int structuralLimit = std::min(8, static_cast<int>(beam.size()));
+    const int structuralLimit = std::min(10, static_cast<int>(beam.size()));
     for (int i = 0; i < static_cast<int>(beam.size()) &&
                     static_cast<int>(structuralIndices.size()) < structuralLimit; ++i) {
         const Node& node = beam[static_cast<std::size_t>(i)];
@@ -812,7 +814,18 @@ Move chooseRoot(
             if (!node.root.valid || !node.hasRootSurvival) continue;
             if (node.rootFutureSafeMoves < 3) continue;
             if (node.maxChain + 2 < best->maxChain) continue;
-            if (node.lastChain <= 0 && node.maxChain == 0 && node.score + 50000.0 < best->score)
+
+            const double chainAsset =
+                node.features.chainUnit4 +
+                0.5 * node.features.chainUnit5 +
+                0.35 * node.features.handoffPotential;
+            const bool productive =
+                (node.hasVirtual && node.virtualPotential >= 10000.0) ||
+                node.triggerRoute >= 5 ||
+                chainAsset >= 1.25 ||
+                node.lastChain > 0;
+            if (!productive) continue;
+            if (node.score + 120000.0 < best->score && node.maxChain <= best->maxChain)
                 continue;
 
             if (!escape ||
