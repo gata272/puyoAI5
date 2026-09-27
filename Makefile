@@ -39,6 +39,10 @@ test:
 		-o /tmp/puyoai_virtual_test
 	/tmp/puyoai_virtual_test
 	$(CXX) $(CXXFLAGS) $(INCLUDES) \
+		tests/test_geometry_policy.cpp $(AI_SOURCES) \
+		-o /tmp/puyoai_geometry_test
+	/tmp/puyoai_geometry_test
+	$(CXX) $(CXXFLAGS) $(INCLUDES) \
 		tests/test_game_history.cpp ai/evaluation/game_history.cpp ai/simulation/board.cpp \
 		-o /tmp/puyoai_game_history_test
 	/tmp/puyoai_game_history_test
