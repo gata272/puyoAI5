@@ -26,13 +26,9 @@ int main() {
 
     assert(mf.centralPeak > ff.centralPeak);
     assert(ef.edgeWall >= ff.edgeWall);
-    assert(std::isfinite(mf.futureConstructionSpace));
+    assert(std::isfinite(mf.futureChainSpace));
     assert(std::isfinite(ef.edgeDeadEnd));
 
-    // A central exact-three trigger with two horizontal escape directions
-    // should have more construction room than an otherwise isolated edge
-    // trigger.  The test uses different colours so the two triples cannot
-    // accidentally merge into one component.
     Board triggers;
     triggers.set(2,0,Cell::Red);
     triggers.set(2,1,Cell::Red);
@@ -41,8 +37,9 @@ int main() {
     triggers.set(0,1,Cell::Blue);
     triggers.set(0,2,Cell::Blue);
     const auto tf = extractStaticFeatures(triggers);
-    assert(tf.triggerExpansionSpace > 0.0);
-    assert(std::isfinite(tf.triggerExpansionSpace));
+    assert(tf.handoffPotential > 0.0);
+    assert(std::isfinite(tf.futureChainSpace));
+    assert(std::isfinite(tf.handoffPotential));
     assert(std::isfinite(tf.edgeDeadEnd));
 
     std::cout << "geometry policy tests passed\n";
