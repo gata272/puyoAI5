@@ -51,6 +51,7 @@ struct Node {
     int previousFutureSafeMoves = -1;
     int previousFutureGeometricMoves = -1;
     int rootFutureSafeMoves = -1;
+    int rootBestNextSafeMoves = -1;
     double rootSurvivalScore = 0.0;
     bool hasRootSurvival = false;
     int futureGeometricMoves = -1;
@@ -62,6 +63,11 @@ struct Node {
     // Root-action diagnostics are only used for diagnostics and the genuinely
     // critical escape rule. The explicit probe flags are important: zero is a
     // valid measured result, but it must not also mean "not probed".
+    int trueTriggerPath = -1;
+    int trueImmediateChains = 0;
+    int trueFollowupChains = 0;
+    bool hasTrueProbe = false;
+
     int rootTrueTriggerPath = 0;
     int rootTrueImmediateChains = 0;
     int rootTrueFollowupChains = 0;
@@ -274,8 +280,37 @@ double survivalCorrection(const Node& n) {
     return n.survivalScore * std::clamp(protection, 0.52, 1.0);
 }
 
+double rootSafetyCorrection(const Node& n) {
+    if (!n.hasRootSurvival || n.rootFutureSafeMoves < 0 || n.rootFutureSafeMoves > 5)
+        return 0.0;
+
+    static constexpr double safePenalty[] = {
+        -30000.0, // 0
+        -12000.0, // 1
+        -3500.0,  // 2
+        -1000.0,  // 3
+        0.0,      // 4
+        0.0,      // 5+
+        0.0
+    };
+    double score = safePenalty[std::clamp(n.rootFutureSafeMoves, 0, 6)];
+
+    const int rootNextSafe = n.rootBestNextSafeMoves >= 0
+        ? n.rootBestNextSafeMoves : n.bestNextSafeMoves;
+    if (rootNextSafe >= 0 && n.rootFutureSafeMoves <= 4) {
+        if (rootNextSafe <= 0) score -= 5000.0;
+        else if (rootNextSafe == 1) score -= 2500.0;
+        else if (rootNextSafe == 2) score -= 1000.0;
+    }
+    score += std::clamp(0.35 * n.rootSurvivalScore, -20000.0, 0.0);
+
+    if (n.hasSurvival && n.futureSafeMoves >= 8) score *= 0.10;
+    else if (n.hasSurvival && n.futureSafeMoves >= 6) score *= 0.25;
+    return std::clamp(score, -50000.0, 0.0);
+}
+
 double beamUtility(const Node& n) {
-    return n.score + survivalCorrection(n);
+    return n.score + survivalCorrection(n) + rootSafetyCorrection(n);
 }
 
 bool betterForBeam(const Node& a, const Node& b) {
@@ -444,6 +479,10 @@ void applySurvivalProbe(
         node.bestNextGeometricMoves = h.bestNextGeometricMoves;
         node.bestNextSafeMoves = h.bestNextSafeMoves;
         node.survivalScore = survivalHorizonScore(h, previousSafeMoves, previousGeometricMoves);
+        node.trueTriggerPath = h.trueTriggerPath;
+        node.trueImmediateChains = h.trueImmediateChains;
+        node.trueFollowupChains = h.trueFollowupChains;
+        node.hasTrueProbe = true;
 
         if (depth == 1) {
             node.rootMaxHeight = maxHeight;
@@ -464,6 +503,7 @@ void applySurvivalProbe(
 
         if (depth == 1) {
             node.rootFutureSafeMoves = h.safeMoves;
+            node.rootBestNextSafeMoves = h.bestNextSafeMoves;
             node.rootSurvivalScore = node.survivalScore;
             node.hasRootSurvival = true;
         }
@@ -540,6 +580,10 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " next2Geom=" << x.bestNextGeometricMoves
             << " next2Safe=" << x.bestNextSafeMoves
             << " survival=" << x.survivalScore
+            << " truePath=" << x.trueTriggerPath
+            << " trueNow=" << x.trueImmediateChains
+            << " trueFollow=" << x.trueFollowupChains
+            << " trueProbe=" << (x.hasTrueProbe ? 1 : 0)
             << " rootTruePath=" << x.rootTrueTriggerPath
             << " rootTrueNow=" << x.rootTrueImmediateChains
             << " rootTrueFollow=" << x.rootTrueFollowupChains
@@ -556,7 +600,7 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
 }
 
 double finalUtility(const Node& n) {
-    const double survival = survivalCorrection(n);
+    const double survival = survivalCorrection(n) + rootSafetyCorrection(n);
 
     double constructionGate = 1.0;
     if (n.hasVirtual) {
@@ -566,18 +610,42 @@ double finalUtility(const Node& n) {
         else if (n.virtualPotential < 60000.0) constructionGate = 0.84;
     }
 
+    double routeGate = 1.0;
+    const int visibleTruePath = n.hasTrueProbe
+        ? n.trueTriggerPath
+        : (n.hasRootTrueProbe ? n.rootTrueTriggerPath : -1);
+    const auto h = n.board.heights();
+    const int maxHeight = *std::max_element(h.begin(), h.end());
+    const bool currentDanger = n.hasSurvival
+        ? ((n.futureSafeMoves >= 0 && n.futureSafeMoves <= 5) ||
+           (n.bestNextSafeMoves >= 0 && n.bestNextSafeMoves <= 2))
+        : (h[2] >= 9 || maxHeight >= 11);
+    if (currentDanger && visibleTruePath >= 0) {
+        if (visibleTruePath <= 0) routeGate = 0.22;
+        else if (visibleTruePath == 1) routeGate = 0.55;
+        else if (visibleTruePath == 2) routeGate = 0.78;
+    }
+
     const double viability = n.hasTriggerViability
-        ? n.triggerViabilityScore
+        ? n.triggerViabilityScore * routeGate
         : 0.0;
 
-    const double gatedConstruction =
-        (static_cast<double>(n.mainChain.length()) * 16000.0 +
-         n.mainChainScore * 0.50 +
-         n.construction * 0.06 -
-         n.prematureRisk * 0.06) * constructionGate;
+    const double constructionRaw =
+        static_cast<double>(n.mainChain.length()) * 16000.0 +
+        n.mainChainScore * 0.50 +
+        n.construction * 0.06 -
+        n.prematureRisk * 0.06;
+    const double gatedConstruction = constructionRaw >= 0.0
+        ? constructionRaw * constructionGate * routeGate
+        : constructionRaw * constructionGate;
+
+    double gatedVirtual = n.virtualPotential;
+    if (currentDanger && n.hasTrueProbe && gatedVirtual > 0.0) {
+        gatedVirtual *= routeGate;
+    }
 
     return n.score + static_cast<double>(n.maxChain) * 25000.0
-         + n.virtualPotential
+         + gatedVirtual
          + gatedConstruction
          + viability * (constructionGate < 0.65 ? 0.72 : 0.22)
          + survival;
@@ -808,7 +876,7 @@ Move chooseRoot(
     bool criticalEscapeApplied = false;
 
     if (best->hasRootSurvival &&
-        best->rootFutureSafeMoves >= 0 && best->rootFutureSafeMoves <= 1) {
+        best->rootFutureSafeMoves >= 0 && best->rootFutureSafeMoves <= 2) {
         const Node* escape = nullptr;
         for (const auto& node : beam) {
             if (!node.root.valid || !node.hasRootSurvival) continue;
