@@ -66,6 +66,7 @@ struct Node {
     int rootTriggerRoute = 0;
     int rootMaxHeight = 0;
     int rootDangerHeight = 0;
+    bool historicalStale = false;
 
     bool gameOver = false;
     std::uint64_t boardHash = 0;
@@ -199,6 +200,7 @@ std::vector<Node> expandNode(
         candidate.rootTriggerRoute = parent.rootTriggerRoute;
         candidate.rootMaxHeight = parent.rootMaxHeight;
         candidate.rootDangerHeight = parent.rootDangerHeight;
+        candidate.historicalStale = parent.historicalStale;
         candidate.gameOver = deathMove;
 
         if (deathMove) death.push_back(std::move(candidate));
@@ -300,6 +302,66 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
                 }
             }
             if (!duplicate) selected.push_back(*node);
+        }
+    }
+
+    // Root Rescue Reserve -------------------------------------------------
+    //
+    // If the committed root action has become stale across turns (or the
+    // current root diagnostics already look stale), do not let every safer
+    // alternative disappear during deeper beam pruning.  This is a RESERVE,
+    // not a ranking change: ordinary long-chain utility still decides the
+    // final move unless the actual emergency selector later needs the rescue.
+    // Keeping only one or two roots is intentional; broad survival weighting
+    // was shown to destroy the high-chain behavior in earlier versions.
+    if (dangerPresent) {
+        const Node* bestRoot = candidates.empty() ? nullptr : &candidates.front();
+        bool staleRootPresent = false;
+        if (bestRoot && bestRoot->root.valid && bestRoot->hasRootSurvival) {
+            staleRootPresent =
+                bestRoot->rootFutureSafeMoves >= 0 &&
+                bestRoot->rootFutureSafeMoves <= 4 &&
+                bestRoot->rootTrueTriggerPath <= 1 &&
+                (bestRoot->historicalStale || bestRoot->rootTriggerRoute >= 7);
+        }
+
+        if (staleRootPresent) {
+            const int bestChain = bestRoot->maxChain;
+            const double bestScore = bestRoot->score;
+            std::vector<const Node*> rescue;
+            rescue.reserve(candidates.size());
+            for (const auto& node : candidates) {
+                if (!node.root.valid || !node.hasRootSurvival) continue;
+                if (node.rootFutureSafeMoves < 6) continue;
+                const bool chainCompatible = node.maxChain + 2 >= bestChain;
+                const bool scoreCompatible = node.score >= bestScore - 100000.0;
+                if (!chainCompatible && !scoreCompatible) continue;
+                rescue.push_back(&node);
+            }
+
+            std::sort(rescue.begin(), rescue.end(), [](const Node* a, const Node* b) {
+                if (a->rootFutureSafeMoves != b->rootFutureSafeMoves)
+                    return a->rootFutureSafeMoves > b->rootFutureSafeMoves;
+                if (a->maxChain != b->maxChain)
+                    return a->maxChain > b->maxChain;
+                return a->score > b->score;
+            });
+
+            const int rescueSlots = std::min(2, std::max(1, beamWidth / 6));
+            for (const Node* node : rescue) {
+                if (static_cast<int>(selected.size()) >= beamWidth) break;
+                if (static_cast<int>(selected.size()) >= rescueSlots +
+                    std::min(std::max(1, beamWidth / 4), beamWidth)) break;
+                bool duplicateRoot = false;
+                for (const auto& existing : selected) {
+                    if (existing.root.x == node->root.x &&
+                        existing.root.rotation == node->root.rotation) {
+                        duplicateRoot = true;
+                        break;
+                    }
+                }
+                if (!duplicateRoot) selected.push_back(*node);
+            }
         }
     }
 
@@ -416,6 +478,11 @@ void applySurvivalProbe(
         // normal construction score. The richer survival_horizon probe uses
         // only the currently visible next two pairs.
         if (depth == 1) {
+            // Root geometry is cheap and must remain available even when the
+            // detailed true-trigger probe is skipped. It is used only for the
+            // narrowly-scoped stale/emergency detector.
+            node.rootMaxHeight = maxHeight;
+            node.rootDangerHeight = heights[2];
             const bool emergencyProbe =
                 h.safeMoves >= 0 && h.safeMoves <= 5 &&
                 (maxHeight >= 11 || heights[2] >= 9 ||
@@ -574,7 +641,8 @@ Move chooseRoot(
     const std::vector<PuyoPair>& pieces,
     const Weights& weights,
     int maxDepth,
-    int beamWidth
+    int beamWidth,
+    const GameHistory& history
 ) {
     if (pieces.empty()) return {-1, 0, false};
 
@@ -596,6 +664,10 @@ Move chooseRoot(
     Node root;
     root.board = board;
     root.boardHash = fastBoardHash(root.board);
+    root.historicalStale =
+        history.quietTurns >= 2 &&
+        history.lastActualChain <= 1 &&
+        history.clearDebtScore() >= 24;
     root.features = extractStaticFeatures(board);
     root.hasFeatures = true;
     root.mainChain = analyzeMainChain(board);
@@ -768,7 +840,43 @@ Move chooseRoot(
     // escape: a root with very low future mobility, a high theoretical trigger
     // route, but no realizable path using the actually visible next pairs.
     const Node* selected = &(*best);
+    bool rootRescueApplied = false;
     bool emergencyEscapeApplied = false;
+
+    // Moderate root rescue: when the committed root has become narrow and the
+    // actual visible route is not progressing, prefer a much safer root only
+    // if it also preserves substantially more realized/available chain
+    // material. This is intentionally a final-candidate rule, not a general
+    // survival weight. It targets the observed failure where a safe,
+    // chain-preserving root survived in the beam but lost to a brittle
+    // theoretical route during terminal structural scoring.
+    if (best->hasRootSurvival &&
+        best->rootFutureSafeMoves >= 0 && best->rootFutureSafeMoves <= 6 &&
+        best->rootTrueTriggerPath <= 1 &&
+        best->historicalStale) {
+        const double bestUtility = finalUtility(*best);
+        const Node* rescue = nullptr;
+        for (const auto& node : beam) {
+            if (!node.root.valid || !node.hasRootSurvival) continue;
+            if (node.rootFutureSafeMoves < best->rootFutureSafeMoves + 6) continue;
+            if (node.maxChain < best->maxChain + 2) continue;
+            if (finalUtility(node) + 260000.0 < bestUtility) continue;
+            if (!rescue ||
+                node.rootFutureSafeMoves > rescue->rootFutureSafeMoves ||
+                (node.rootFutureSafeMoves == rescue->rootFutureSafeMoves &&
+                 node.maxChain > rescue->maxChain) ||
+                (node.rootFutureSafeMoves == rescue->rootFutureSafeMoves &&
+                 node.maxChain == rescue->maxChain &&
+                 finalUtility(node) > finalUtility(*rescue))) {
+                rescue = &node;
+            }
+        }
+        if (rescue) {
+            selected = rescue;
+            rootRescueApplied = true;
+        }
+    }
+
     if (best->hasRootSurvival && best->rootFutureSafeMoves <= 1) {
         for (const auto& node : beam) {
             if (!node.root.valid || !node.hasRootSurvival || node.rootFutureSafeMoves < 2) continue;
@@ -787,7 +895,7 @@ Move chooseRoot(
         best->hasRootSurvival &&
         best->rootFutureSafeMoves <= 4 &&
         best->rootTrueTriggerPath <= 1 &&
-        best->rootTriggerRoute >= 7 &&
+        (best->historicalStale || best->rootTriggerRoute >= 7) &&
         (best->rootMaxHeight >= 10 || best->rootDangerHeight >= 9);
 
     if (staleRouteEmergency) {
@@ -804,7 +912,9 @@ Move chooseRoot(
             const bool routeCompatible =
                 (node.rootTriggerRoute >= 5 &&
                  node.rootTriggerRoute + 2 >= best->rootTriggerRoute) ||
-                (node.rootTrueTriggerPath >= 2);
+                (node.rootTrueTriggerPath >= 2) ||
+                (node.maxChain + 2 >= best->maxChain &&
+                 finalUtility(node) >= finalUtility(*best) - 120000.0);
             if (!routeCompatible) continue;
 
             if (!escape ||
@@ -837,6 +947,8 @@ Move chooseRoot(
             << " rootSafe=" << selected->rootFutureSafeMoves
             << " rootTruePath=" << selected->rootTrueTriggerPath
             << " rootRoute=" << selected->rootTriggerRoute
+            << " historicalStale=" << (selected->historicalStale ? 1 : 0)
+            << " rootRescue=" << (rootRescueApplied ? 1 : 0)
             << " emergencyEscape=" << (emergencyEscapeApplied ? 1 : 0)
             << " mainRoute=";
         for (std::size_t i = 0; i < selected->mainChain.colors.size(); ++i) {
@@ -862,10 +974,10 @@ Move BeamSearch::chooseMove(
     int beamWidth,
     const GameHistory& history
 ) const {
-    (void)history;
     return chooseRoot(board, pieces, weights,
                       std::clamp(depth, 1, 50),
-                      std::clamp(beamWidth, 1, 500));
+                      std::clamp(beamWidth, 1, 500),
+                      history);
 }
 
 } // namespace puyo
