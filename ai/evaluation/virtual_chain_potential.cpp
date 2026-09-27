@@ -121,6 +121,18 @@ double virtualChainPotentialScore(const VirtualChainFeatures& f, const Board& bo
     if (f.bestChain >= 12) score += 60000.0;
     if (f.bestChain >= 13) score += 80000.0;
 
+    // v13/v12AC both reward not only the single best hypothetical fire but
+    // also repeatability across several virtual routes. Keep that signal
+    // separate so one lucky probe does not dominate, while making mature
+    // 10-13 chain boards measurably different from 7-9 boards.
+    score += std::max(0, f.top3ChainSum - 22) * 2500.0;
+    score += std::max(0, f.top3ChainSum - 28) * 5000.0;
+    if (f.bestChain >= 9) {
+        score += static_cast<double>(std::min(f.count3Plus, 10)) * 1200.0;
+    }
+    if (f.bestChain >= 11 && f.top3ChainSum >= 29) score += 35000.0;
+    if (f.bestChain >= 12 && f.top3ChainSum >= 32) score += 50000.0;
+
     // High stacks are acceptable when there is corresponding virtual
     // firepower. Penalize only the dangerous mismatch, not high boards in
     // general; this is important for 10-13 chain construction.
@@ -132,7 +144,7 @@ double virtualChainPotentialScore(const VirtualChainFeatures& f, const Board& bo
     }
     if (maxHeight >= VISIBLE_HEIGHT) score -= 100000.0;
 
-    return std::clamp(score, -100000.0, 450000.0);
+    return std::clamp(score, -100000.0, 1500000.0);
 }
 
 } // namespace puyo
