@@ -8,6 +8,7 @@
 #include "../evaluation/debug_log.h"
 #include "../evaluation/virtual_chain_potential.h"
 #include "../evaluation/survival_horizon.h"
+#include "../evaluation/route_recovery.h"
 #include "../simulation/simulator.h"
 
 #include <algorithm>
@@ -77,6 +78,26 @@ struct Node {
     bool hasRootTrueProbe = false;
     bool hasRootRouteProbe = false;
     bool historicalStale = false;
+
+    int previousStaleRouteAge = 0;
+    int previousBestNextSafeMoves = -1;
+    int currentTriggerRoute = 0;
+    bool hasCurrentRouteProbe = false;
+    int staleRouteAge = 0;
+    RouteRecoveryState routeRecovery;
+    RouteRecoveryState rootRouteRecovery;
+    bool hasRootRouteRecovery = false;
+    bool rebuildPolicy = false;
+    int productiveNextMoves = 0;
+    int productiveFollowupMoves = 0;
+    int bestImmediateNetClear = 0;
+    int bestImmediatePostSafeMoves = -1;
+    int bestFollowupNetClear = 0;
+    int bestRebuildChain = 0;
+    int bestRebuildNetClear = 0;
+    int bestRebuildNextSafeMoves = -1;
+    double recoveryScore = 0.0;
+    bool hasRecoveryProbe = false;
 
     bool gameOver = false;
     std::uint64_t boardHash = 0;
@@ -245,6 +266,25 @@ std::vector<Node> expandNode(
         candidate.hasRootTrueProbe = parent.hasRootTrueProbe;
         candidate.hasRootRouteProbe = parent.hasRootRouteProbe;
         candidate.historicalStale = parent.historicalStale;
+        candidate.previousStaleRouteAge = parent.staleRouteAge;
+        candidate.previousBestNextSafeMoves = parent.hasSurvival ? parent.bestNextSafeMoves : -1;
+        candidate.currentTriggerRoute = parent.currentTriggerRoute;
+        candidate.hasCurrentRouteProbe = parent.hasCurrentRouteProbe;
+        candidate.staleRouteAge = parent.staleRouteAge;
+        candidate.routeRecovery = parent.routeRecovery;
+        candidate.rootRouteRecovery = parent.rootRouteRecovery;
+        candidate.hasRootRouteRecovery = parent.hasRootRouteRecovery;
+        candidate.rebuildPolicy = parent.rebuildPolicy;
+        candidate.productiveNextMoves = 0;
+        candidate.productiveFollowupMoves = 0;
+        candidate.bestImmediateNetClear = 0;
+        candidate.bestImmediatePostSafeMoves = -1;
+        candidate.bestFollowupNetClear = 0;
+        candidate.bestRebuildChain = 0;
+        candidate.bestRebuildNetClear = 0;
+        candidate.bestRebuildNextSafeMoves = -1;
+        candidate.recoveryScore = 0.0;
+        candidate.hasRecoveryProbe = false;
         candidate.gameOver = deathMove;
 
         if (deathMove) death.push_back(std::move(candidate));
@@ -257,6 +297,25 @@ std::vector<Node> expandNode(
     // instead of producing an invalid/no-op move.
     if (!safe.empty()) return safe;
     return death;
+}
+
+bool recoveryReserveCandidate(const Node& n) {
+    if (!n.hasRecoveryProbe) return false;
+    if (n.routeRecovery.status == RouteRecoveryStatus::Weak &&
+        (n.routeRecovery.deltaSafeMoves > 0 ||
+         n.routeRecovery.deltaBestNextSafeMoves > 0 ||
+         n.productiveFollowupMoves > 0)) {
+        return true;
+    }
+    if ((n.routeRecovery.status == RouteRecoveryStatus::Stale ||
+         n.routeRecovery.status == RouteRecoveryStatus::Abandon) &&
+        (n.routeRecovery.deltaSafeMoves >= 1 ||
+         n.routeRecovery.deltaBestNextSafeMoves >= 1 ||
+         n.productiveFollowupMoves > 0 ||
+         n.bestRebuildChain > 0)) {
+        return true;
+    }
+    return false;
 }
 
 double survivalCorrection(const Node& n) {
@@ -365,23 +424,27 @@ void pruneBeam(std::vector<Node>& candidates, int beamWidth) {
         }
     }
 
-    if (dangerPresent) {
+    bool recoveryPresent = false;
+    for (const auto& node : candidates) { if (recoveryReserveCandidate(node)) { recoveryPresent = true; break; } }
+
+    if (dangerPresent || recoveryPresent) {
         std::vector<const Node*> safety;
         safety.reserve(candidates.size());
         for (const auto& node : candidates) {
             if (node.hasSurvival) safety.push_back(&node);
         }
         std::sort(safety.begin(), safety.end(), [](const Node* a, const Node* b) {
+            if (recoveryReserveCandidate(*a) != recoveryReserveCandidate(*b)) return recoveryReserveCandidate(*a) > recoveryReserveCandidate(*b);
+            if (a->recoveryScore != b->recoveryScore) return a->recoveryScore > b->recoveryScore;
             const int as = a->futureSafeMoves;
             const int bs = b->futureSafeMoves;
             if (as != bs) return as > bs;
-            if (a->bestNextSafeMoves != b->bestNextSafeMoves)
-                return a->bestNextSafeMoves > b->bestNextSafeMoves;
+            if (a->bestNextSafeMoves != b->bestNextSafeMoves) return a->bestNextSafeMoves > b->bestNextSafeMoves;
             if (a->maxChain != b->maxChain) return a->maxChain > b->maxChain;
             return a->score > b->score;
         });
 
-        const int reserve = std::min(2, std::max(0, beamWidth - rootReserve));
+        const int reserve = std::min(recoveryPresent ? 2 : 1, std::max(0, beamWidth - rootReserve));
         for (const Node* node : safety) {
             if (static_cast<int>(selected.size()) >= rootReserve + reserve) break;
             bool duplicateBoard = false;
@@ -483,6 +546,24 @@ void applySurvivalProbe(
         node.trueImmediateChains = h.trueImmediateChains;
         node.trueFollowupChains = h.trueFollowupChains;
         node.hasTrueProbe = true;
+        node.productiveNextMoves = h.productiveNextMoves;
+        node.productiveFollowupMoves = h.productiveFollowupMoves;
+        node.bestImmediateNetClear = h.bestImmediateNetClear;
+        node.bestImmediatePostSafeMoves = h.bestImmediatePostSafeMoves;
+        node.bestFollowupNetClear = h.bestFollowupNetClear;
+        node.bestRebuildChain = h.bestRebuildChain;
+        node.bestRebuildNetClear = h.bestRebuildNetClear;
+        node.bestRebuildNextSafeMoves = h.bestRebuildNextSafeMoves;
+        if (h.safeMoves >= 0 && h.safeMoves <= 5) {
+            node.currentTriggerRoute = triggerRouteLength(node.board);
+            node.hasCurrentRouteProbe = true;
+        }
+        if (node.hasCurrentRouteProbe || h.trueTriggerPath > 0) {
+            node.routeRecovery = analyzeRouteRecovery(node.currentTriggerRoute, h.trueTriggerPath, h.safeMoves, previousSafeMoves, h.bestNextSafeMoves, node.previousBestNextSafeMoves, node.previousStaleRouteAge, h.productiveNextMoves, h.productiveFollowupMoves, h.bestImmediateNetClear, h.bestRebuildChain, h.bestRebuildNetClear, h.bestRebuildNextSafeMoves, maxHeight, node.rebuildPolicy);
+            node.staleRouteAge = node.routeRecovery.staleAge;
+            node.recoveryScore = node.routeRecovery.score;
+            node.hasRecoveryProbe = true;
+        }
 
         if (depth == 1) {
             node.rootMaxHeight = maxHeight;
@@ -506,6 +587,7 @@ void applySurvivalProbe(
             node.rootBestNextSafeMoves = h.bestNextSafeMoves;
             node.rootSurvivalScore = node.survivalScore;
             node.hasRootSurvival = true;
+            if (node.hasRecoveryProbe) { node.rootRouteRecovery = node.routeRecovery; node.hasRootRouteRecovery = true; }
         }
         node.hasSurvival = true;
     }
@@ -590,6 +672,9 @@ void debugBeamSummary(const std::vector<Node>& beam, int depth, int beamWidth) {
             << " rootTrueProbe=" << (x.hasRootTrueProbe ? 1 : 0)
             << " rootRoute=" << x.rootTriggerRoute
             << " rootRouteProbe=" << (x.hasRootRouteProbe ? 1 : 0)
+            << " recovery=" << routeRecoveryStatusName(x.routeRecovery.status)
+            << " staleAge=" << x.staleRouteAge
+            << " recoveryScore=" << x.recoveryScore
             << " rootSafe=" << x.rootFutureSafeMoves
             << " structure=" << x.structure
             << " mainChain=" << x.mainChain.length()
@@ -624,6 +709,13 @@ double finalUtility(const Node& n) {
         if (visibleTruePath <= 0) routeGate = 0.22;
         else if (visibleTruePath == 1) routeGate = 0.55;
         else if (visibleTruePath == 2) routeGate = 0.78;
+    }
+    const bool currentRecoveryDanger =
+        n.hasSurvival && n.futureSafeMoves >= 0 && n.futureSafeMoves <= 5;
+    if (currentRecoveryDanger && n.routeRecovery.status == RouteRecoveryStatus::Stale) {
+        routeGate = std::min(routeGate, 0.18);
+    } else if (currentRecoveryDanger && n.routeRecovery.status == RouteRecoveryStatus::Abandon) {
+        routeGate = std::min(routeGate, 0.10);
     }
 
     const double viability = n.hasTriggerViability
@@ -708,6 +800,7 @@ Move chooseRoot(
         history.quietTurns >= 2 &&
         history.lastActualChain <= 1 &&
         history.clearDebtScore() >= 24;
+    root.rebuildPolicy = history.inRebuild();
     root.features = extractStaticFeatures(board);
     root.hasFeatures = true;
     root.mainChain = analyzeMainChain(board);
@@ -912,6 +1005,25 @@ Move chooseRoot(
         }
     }
 
+    bool recoveryEscapeApplied = false;
+    if (!criticalEscapeApplied && best->hasRootRouteRecovery &&
+        (best->rootRouteRecovery.status == RouteRecoveryStatus::Stale || best->rootRouteRecovery.status == RouteRecoveryStatus::Abandon || best->rootRouteRecovery.status == RouteRecoveryStatus::Weak)) {
+        const Node* escape = nullptr;
+        for (const auto& node : beam) {
+            if (!node.root.valid || !node.hasRootSurvival || !node.hasRootRouteRecovery) continue;
+            const bool reconnected = node.rootRouteRecovery.status == RouteRecoveryStatus::Connected || node.rootTrueTriggerPath >= 2;
+            const bool safer = node.rootFutureSafeMoves >= best->rootFutureSafeMoves + 2;
+            const bool productive = node.bestRebuildChain > 0 || node.productiveFollowupMoves > 0 || node.rootTrueImmediateChains > 0 || node.rootTrueFollowupChains > 0;
+            if (!reconnected && !safer) continue;
+            if (!productive && !safer) continue;
+            if (node.maxChain + 4 < best->maxChain && !safer) continue;
+            if (!escape || node.rootFutureSafeMoves > escape->rootFutureSafeMoves ||
+                (node.rootFutureSafeMoves == escape->rootFutureSafeMoves && node.rootRouteRecovery.score > escape->rootRouteRecovery.score) ||
+                (node.rootFutureSafeMoves == escape->rootFutureSafeMoves && node.rootRouteRecovery.score == escape->rootRouteRecovery.score && node.maxChain > escape->maxChain)) escape = &node;
+        }
+        if (escape) { selected = escape; recoveryEscapeApplied = true; }
+    }
+
     if (debugLoggingEnabled()) {
         std::ostringstream oss;
         oss << "[AI-DEBUG] SELECT root=(" << selected->root.x << "," << selected->root.rotation
@@ -932,8 +1044,13 @@ Move chooseRoot(
             << " rootTrueProbe=" << (selected->hasRootTrueProbe ? 1 : 0)
             << " rootRoute=" << selected->rootTriggerRoute
             << " rootRouteProbe=" << (selected->hasRootRouteProbe ? 1 : 0)
+            << " routeRecovery=" << routeRecoveryStatusName(selected->routeRecovery.status)
+            << " staleAge=" << selected->staleRouteAge
+            << " recoveryScore=" << selected->recoveryScore
+            << " rootRecovery=" << routeRecoveryStatusName(selected->rootRouteRecovery.status)
             << " historicalStale=" << (selected->historicalStale ? 1 : 0)
             << " criticalEscape=" << (criticalEscapeApplied ? 1 : 0)
+            << " recoveryEscape=" << (recoveryEscapeApplied ? 1 : 0)
             << " mainRoute=";
         for (std::size_t i = 0; i < selected->mainChain.colors.size(); ++i) {
             if (i) oss << "->";
