@@ -15,6 +15,7 @@ AI_SOURCES := \
 	ai/evaluation/forms.cpp \
 	ai/evaluation/debug_log.cpp \
 	ai/evaluation/survival_horizon.cpp \
+	ai/evaluation/route_recovery.cpp \
 	ai/evaluation/game_history.cpp \
 	ai/search/move_generator.cpp \
 	ai/search/beam_search.cpp \
@@ -46,6 +47,10 @@ test:
 		tests/test_game_history.cpp ai/evaluation/game_history.cpp ai/simulation/board.cpp \
 		-o /tmp/puyoai_game_history_test
 	/tmp/puyoai_game_history_test
+	$(CXX) $(CXXFLAGS) $(INCLUDES) \
+		tests/test_route_recovery.cpp ai/evaluation/route_recovery.cpp \
+		-o /tmp/puyoai_route_recovery_test
+	/tmp/puyoai_route_recovery_test
 
 benchmark-test:
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pedantic $(INCLUDES) \
@@ -66,4 +71,4 @@ benchmark:
 	/tmp/puyoai_benchmark 4 60 20260908 2 4
 
 clean:
-	rm -f /tmp/puyoai_test /tmp/puyoai_construction_test /tmp/puyoai_virtual_test /tmp/puyoai_benchmark_test /tmp/puyoai_benchmark_stream_test /tmp/puyoai_benchmark
+	rm -f /tmp/puyoai_test /tmp/puyoai_construction_test /tmp/puyoai_virtual_test /tmp/puyoai_game_history_test /tmp/puyoai_route_recovery_test /tmp/puyoai_benchmark_test /tmp/puyoai_benchmark_stream_test /tmp/puyoai_benchmark
