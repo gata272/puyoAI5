@@ -50,6 +50,11 @@ private:
     std::string patternName_;
     GameHistory history_;
 
+    // Fire-layer state: the turn since which a >=4 chain has been
+    // continuously available under progressing suffocation.  Used for
+    // the grace period before a forced fire (see decideFireMove).
+    int dangerChainSinceTurn_ = -1;
+
     void observeChosenMove(
         int turn,
         const Board& board,
