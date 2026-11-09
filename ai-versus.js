@@ -71,7 +71,9 @@
 
         ensure() {
             if (this.worker) return;
-            this.worker = new Worker('./puyo-ai-worker-wasm.js');
+            // puyo-ai-worker-wasm.js は ES モジュール（import を使用）。
+            // puyoAI.js と同じく type:'module' で生成しないと起動しない。
+            this.worker = new Worker('./puyo-ai-worker-wasm.js', { type: 'module' });
             this.worker.onmessage = (e) => {
                 const msg = e.data || {};
                 if (msg.type === 'ready') {
@@ -112,10 +114,23 @@
         },
 
         think(board, pieces, turn) {
-            return this.waitReady().then(
+            // ready が来ない場合も 6 秒で見切る（その後はフォールバック手で継続）
+            return Promise.race([this.waitReady(), sleep(6000)]).then(
                 () =>
                     new Promise((resolve) => {
-                        this.pendingMove = resolve;
+                        // ワーカーが応答しない場合はタイムアウトで null を返し、
+                        // エンジン側の合法手フォールバックで対戦を継続する
+                        const timer = setTimeout(() => {
+                            if (this.pendingMove === wrapped) {
+                                this.pendingMove = null;
+                                resolve(null);
+                            }
+                        }, 4000);
+                        const wrapped = (move) => {
+                            clearTimeout(timer);
+                            resolve(move);
+                        };
+                        this.pendingMove = wrapped;
                         const boardBuffer = new Uint8Array(W * H);
                         for (let y = 0; y < H; y++) {
                             for (let x = 0; x < W; x++) {

@@ -115,6 +115,11 @@
             alert('AI対戦モジュール（ai-versus.js）が読み込まれていません。');
             return;
         }
+        // プレイヤー側の自動プレイ（ソロ用AI）が ON のままだと、対戦中に
+        // 自分の盤面が勝手に動いてしまうため、AI対戦の開始時は止める
+        if (typeof window.setAIAutoEnabled === 'function') {
+            window.setAIAutoEnabled(false);
+        }
         if (conn && conn.open) {
             alert('既に接続済みです');
             return;

@@ -341,6 +341,15 @@
         updateButton();
     };
 
+    // 明示的に自動プレイの ON/OFF を切り替える API（AI対戦開始時に
+    // プレイヤー側の自動プレイを確実に止めるために使う）
+    global.setAIAutoEnabled = function (on) {
+        if (STATE.autoEnabled !== !!on) global.toggleAI();
+    };
+    global.isAIAutoEnabled = function () {
+        return STATE.autoEnabled;
+    };
+
     global.resetAIState = resetAI;
 
     // resetGame() is defined by puyoSim.js. Wrap it once so the AI's
