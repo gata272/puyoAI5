@@ -107,6 +107,23 @@
         }
     };
 
+    // AI対戦（ローカル）: ai-versus.js が用意する仮想コネクションを
+    // PeerJS の接続と同じ形で差し込み、既存の対戦フロー（提案→承認→
+    // startMatch→盤面同期→おじゃま→勝敗→連戦）をそのまま使う。
+    window.startAIMatch = function() {
+        if (typeof window.createAIConnection !== 'function') {
+            alert('AI対戦モジュール（ai-versus.js）が読み込まれていません。');
+            return;
+        }
+        if (conn && conn.open) {
+            alert('既に接続済みです');
+            return;
+        }
+        isHost = true;
+        conn = window.createAIConnection();
+        setupConnection();
+    };
+
     window.rejectMatch = function() {
         const overlay = document.getElementById('match-proposal-overlay');
         if (overlay) overlay.style.display = 'none';
