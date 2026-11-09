@@ -103,6 +103,7 @@ int decideFireMove(const Board& board, const std::vector<PuyoPair>& pieces, Move
 
     FireCandidate bestChain;  // maximise chains, then erased, then mobility
     FireCandidate bestClear;  // maximise erased, then chains, then mobility
+    FireCandidate bestDig;    // maximise erased, then lowest post danger height
     bool haveChain = false;
 
     for (const auto& move : generateLegalMoves(board, pieces.front())) {
@@ -131,6 +132,15 @@ int decideFireMove(const Board& board, const std::vector<PuyoPair>& pieces, Move
             (c.erased == bestClear.erased && c.chains == bestClear.chains &&
              c.postSafeMoves > bestClear.postSafeMoves)) {
             bestClear = c;
+        }
+        if (!haveChain ||
+            c.erased > bestDig.erased ||
+            (c.erased == bestDig.erased &&
+             c.postDangerHeight < bestDig.postDangerHeight) ||
+            (c.erased == bestDig.erased &&
+             c.postDangerHeight == bestDig.postDangerHeight &&
+             c.postSafeMoves > bestDig.postSafeMoves)) {
+            bestDig = c;
         }
         haveChain = true;
     }
@@ -215,6 +225,35 @@ int decideFireMove(const Board& board, const std::vector<PuyoPair>& pieces, Move
              bestClear.erased >= 6 && bestClear.postSafeMoves >= 4) {
         rule = 6;
         pick = &bestClear;
+    }
+    // Rule 8 (variant X, round 6): plateau cleanup.  Long-game replays
+    // (user-supplied 500-turn log, death at turn 302) show a failure
+    // mode the older rules never engage: after a big fire leaves
+    // ~20-30 unstructured puyo behind, the rebuild fills the board
+    // into a flat-topped mesa (all columns 9-13 high, occupancy
+    // climbing past 60) with no chain of 4+ ever becoming available,
+    // so Rules 9/6' stay silent while every placement just raises the
+    // mesa until no safe move remains.  Strong players avoid this by
+    // keeping the post-fire board clean and by actively digging a
+    // stalled board down instead of piling onto it.  So: when the
+    // board is a high flat plateau (or the danger column already
+    // touches 11) AND no real chain is available now or one puyo away
+    // (nothing is being built that a small fire could destroy), take
+    // the max-erasure placement as a cleanup fire -- provided it
+    // actually shrinks the board and leaves plenty of safe moves.
+    // The rule re-evaluates every turn, so a stalled board is dug
+    // down over consecutive turns until it drops out of the plateau
+    // state or a real chain appears.
+    else if (ch <= 3 && occupied >= 48 && bestDig.erased >= 6 &&
+             bestDig.postOccupied <= occupied - 4 &&
+             bestDig.postSafeMoves >= 6) {
+        const int minHeight = *std::min_element(heights.begin(), heights.end());
+        const bool plateau = (maxHeight >= 9 && maxHeight - minHeight <= 4) ||
+                             dangerHeight >= 11;
+        if (plateau && maxTriggerChain(board) <= 3) {
+            rule = 8;
+            pick = &bestDig;
+        }
     }
     // Rule 7: desperate -- almost no safe placement remains.
     else if (currentSafe <= 3 && bestClear.erased >= 4) {
