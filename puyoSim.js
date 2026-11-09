@@ -313,14 +313,6 @@ function dropOjamaToBoard(count) {
     const amount = Math.max(0, Math.min(MAX_OJAMA_DROP_PER_TURN, Math.floor(Number(count) || 0)));
     if (amount === 0) return true;
 
-    const emptyCells = board.reduce((sum, row) => sum + row.filter(c => c === COLORS.EMPTY).length, 0);
-    if (amount > emptyCells) {
-        return false;
-    }
-
-    const fullRounds = Math.floor(amount / WIDTH);
-    const remainder = amount % WIDTH;
-
     const placeOne = (x) => {
         let stackHeight = 0;
         for (let y = 0; y < HEIGHT; y++) {
@@ -331,24 +323,27 @@ function dropOjamaToBoard(count) {
         return true;
     };
 
-    for (let round = 0; round < fullRounds; round++) {
+    // 全列に1個ずつのラウンドを繰り返して落とす。
+    // 盤面に収まりきらない場合も、入る分は実際に落としてから false を返す
+    // （従来は事前チェックで1個も落とさずに死亡していたため、
+    //   死因のおじゃまが盤面に描画されなかった）。
+    let placed = 0;
+    while (placed < amount) {
         const cols = Array.from({ length: WIDTH }, (_, i) => i);
         shuffleArray(cols);
+        let placedThisRound = 0;
         for (const x of cols) {
-            if (!placeOne(x)) return false;
+            if (placed >= amount) break;
+            if (placeOne(x)) {
+                placed++;
+                placedThisRound++;
+            }
         }
-    }
-
-    if (remainder > 0) {
-        const cols = Array.from({ length: WIDTH }, (_, i) => i);
-        shuffleArray(cols);
-        for (let i = 0; i < remainder; i++) {
-            if (!placeOne(cols[i])) return false;
-        }
+        if (placedThisRound === 0) break; // 全列が満杯
     }
 
     gravity();
-    return true;
+    return placed >= amount;
 }
 
 function applyPendingOjamaToBoard() {
@@ -1338,6 +1333,23 @@ async function runChain() {
     const nextGroups = findConnectedPuyos();
     if (nextGroups.length === 0) {
         debugRecordChainEpisode(chainCount);
+
+        // 連鎖で終わった場合も、無連鎖時（上の分岐）と同じ位置で
+        // 全消しボーナスとゲームオーバーを判定する。
+        // （従来はここに判定がなく、全消しボーナスが付かず、死亡判定が
+        //   次ぷよ生成時の衝突チェックまで遅れていた）
+        if (checkBoardEmpty()) {
+            score += ALL_CLEAR_SCORE_BONUS;
+            chainAttackScoreBuffer += ALL_CLEAR_SCORE_BONUS;
+            updateUI();
+        }
+
+        const gameOverLineY2 = HEIGHT - 3;
+        if (board[gameOverLineY2][2] !== COLORS.EMPTY) {
+            triggerGameOver();
+            return;
+        }
+
         gameState = 'playing';
 
         flushChainOjamaBuffer();

@@ -140,6 +140,32 @@
     margin: auto;
 }
 
+/* 相手盤面にも自盤面と同じ「隠し領域」の陰影と、死亡判定位置（3列目・12段目）の×印を付ける */
+#opponent-board > div:nth-child(-n+12) {
+    opacity: 0.5;
+    background-color: rgba(50, 50, 50, 0.5);
+    border-bottom: 1px solid rgba(255, 0, 0, 0.5);
+}
+
+#opponent-board > div:nth-child(15) {
+    position: relative;
+    opacity: 1 !important;
+}
+
+#opponent-board > div:nth-child(15):after {
+    content: 'X';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 1em;
+    color: red;
+    font-weight: bold;
+    opacity: 0.8;
+    pointer-events: none;
+    z-index: 10;
+}
+
 /* 勝利数枠のスタイル */
 #win-count-container {
     display: none;
@@ -184,6 +210,63 @@ body.online-match-active #online-toggle-btn {
 
 body.online-match-active #opponent-board-container {
     display: flex;
+}
+
+/* 対戦中は右側の情報パネルを自盤面の高さ（36px×14＋枠）に収め、
+   NEXTと操作ボタンをスクロールなしで同時に見られるように圧縮する */
+body.online-match-active #info-panel {
+    max-height: 510px;
+    overflow-y: auto;
+}
+
+body.online-match-active #play-info-container {
+    gap: 3px;
+}
+
+body.online-match-active #play-stats-info {
+    gap: 2px;
+}
+
+body.online-match-active .info-box {
+    padding: 2px 3px;
+}
+
+body.online-match-active .info-box h2 {
+    display: inline-block;
+    margin: 0 4px 0 0;
+    font-size: 0.72em;
+}
+
+body.online-match-active #play-next-info .next-puyo-slot {
+    min-height: 36px;
+    padding: 2px;
+}
+
+body.online-match-active #play-next-info .puyo {
+    width: 20px;
+    height: 20px;
+}
+
+body.online-match-active #opponent-board {
+    --opp-cell-size: 13px;
+}
+
+body.online-match-active #opponent-board-container {
+    padding: 3px;
+    margin-top: 2px;
+}
+
+body.online-match-active #opponent-board-container h3 {
+    margin-bottom: 2px;
+    font-size: 0.62em;
+}
+
+body.online-match-active #win-count-container {
+    font-size: 0.8em;
+}
+
+body.online-match-active #ai-status {
+    display: none;
 }
 
 /* 降参ボタン */

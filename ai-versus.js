@@ -360,6 +360,9 @@
             const coords = this.coordsFor(move.x, y, move.rotation);
             this.board[coords[0].y][coords[0].x] = this.current.main;
             this.board[coords[1].y][coords[1].x] = this.current.sub;
+            // puyoSim.js lockPuyo と同じ順序（配置→重力→最上段クリア）で
+            // 落ち着いた盤面を送る（横向きで片側が浮いたまま送らない）
+            this.gravity();
             // 最上段は連鎖判定に使わない（puyoSim.js / Simulator と同じ）
             for (let x = 0; x < W; x++) this.board[H - 1][x] = EMPTY;
             this.current = null;
@@ -443,16 +446,12 @@
             }
         }
 
-        // puyoSim.js dropOjamaToBoard と同じ落下パターン
+        // puyoSim.js dropOjamaToBoard と同じ落下パターン。
+        // 収まりきらない場合も入る分は落としてから false（死亡）を返す。
         dropPendingOjama() {
             if (this.pendingOjama <= 0) return true;
             const amount = Math.min(MAX_OJAMA_DROP, this.pendingOjama);
             this.pendingOjama -= amount;
-            let emptyCells = 0;
-            for (const row of this.board) {
-                for (const c of row) if (c === EMPTY) emptyCells++;
-            }
-            if (amount > emptyCells) return false;
             const placeOne = (x) => {
                 let h = 0;
                 for (let y = 0; y < H; y++) if (this.board[y][x] !== EMPTY) h++;
@@ -460,21 +459,22 @@
                 this.board[h][x] = GARBAGE;
                 return true;
             };
-            const fullRounds = Math.floor(amount / W);
-            const remainder = amount % W;
-            for (let r = 0; r < fullRounds; r++) {
+            let placed = 0;
+            while (placed < amount) {
                 const cols = shuffle([0, 1, 2, 3, 4, 5]);
-                for (const x of cols) if (!placeOne(x)) return false;
-            }
-            if (remainder > 0) {
-                const cols = shuffle([0, 1, 2, 3, 4, 5]);
-                for (let i = 0; i < remainder; i++) {
-                    if (!placeOne(cols[i])) return false;
+                let placedThisRound = 0;
+                for (const x of cols) {
+                    if (placed >= amount) break;
+                    if (placeOne(x)) {
+                        placed++;
+                        placedThisRound++;
+                    }
                 }
+                if (placedThisRound === 0) break;
             }
             this.gravity();
             this.sendUpdate();
-            return true;
+            return placed >= amount;
         }
 
         gameOver() {
